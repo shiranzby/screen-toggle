@@ -1,0 +1,374 @@
+{
+  "operation": "dark",
+  "generation": 1,
+  "pass": true,
+  "dispatch_return_ms": 0.08650000017951243,
+  "observed_presentation_ms": 16.884100001334446,
+  "trace_observed_ms": 215.1134000014281,
+  "presentation_ms": 20.275399999999998,
+  "requested_to_complete_ms": 212.2199,
+  "hardware_ms": 118,
+  "write_ms": 56,
+  "prepare_ms": 94,
+  "total_ms": 212,
+  "start_spread_ms": 0.0,
+  "all_three_overlap_ms": 116.9422,
+  "trace": {
+    "error": null,
+    "generation": 1,
+    "operation": "dark",
+    "outcome": {
+      "changes": [
+        {
+          "elapsed_ms": 116.9422,
+          "id": "ddc:\\\\?\\display#rtk1600#5&391a0754&0&uid4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}",
+          "kind": "external",
+          "pre_read_ms": 0.0,
+          "result": {
+            "Ok": true
+          },
+          "stage": "brightness",
+          "started_ms": 0.2129,
+          "verify_ms": 61.6186,
+          "verify_reads": 1,
+          "wait_ms": 0.0,
+          "write_ms": 55.300000000000004
+        }
+      ],
+      "channels": 1,
+      "elapsed_ms": 118,
+      "prepare_ms": 94,
+      "presentation_ms": 20.275399999999998,
+      "superseded": false,
+      "total_ms": 212,
+      "warnings": [],
+      "write_ms": 56
+    },
+    "pending": true,
+    "requested_to_complete_ms": 212.2199
+  },
+  "samples": [
+    {
+      "window_observed_ms": 2.150100001017563,
+      "cursor_observed_ms": 2.29350000154227,
+      "overlay": false,
+      "cursor_transparent": false,
+      "journal_entries": null
+    },
+    {
+      "window_observed_ms": 6.048900002497248,
+      "cursor_observed_ms": 6.158300002425676,
+      "overlay": false,
+      "cursor_transparent": false,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 11.404400000174064,
+      "cursor_observed_ms": 11.519499999849359,
+      "overlay": false,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 16.884100001334446,
+      "cursor_observed_ms": 17.172500000015134,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 22.881600001710467,
+      "cursor_observed_ms": 23.291600002266932,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 27.610000001004664,
+      "cursor_observed_ms": 27.72490000279504,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 32.134200002474245,
+      "cursor_observed_ms": 32.784800001536496,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 37.59899999931804,
+      "cursor_observed_ms": 37.686800002120435,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 42.441100002179155,
+      "cursor_observed_ms": 42.53489999973681,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 46.78710000007413,
+      "cursor_observed_ms": 46.87240000203019,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 51.011200001084944,
+      "cursor_observed_ms": 51.139400002284674,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 55.697700001474004,
+      "cursor_observed_ms": 55.78280000190716,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 60.27180000091903,
+      "cursor_observed_ms": 60.3627000018605,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 64.78170000264072,
+      "cursor_observed_ms": 64.87460000062129,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 69.04690000010305,
+      "cursor_observed_ms": 69.13619999977527,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 73.33460000154446,
+      "cursor_observed_ms": 73.70110000192653,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 77.9504000020097,
+      "cursor_observed_ms": 78.0802000008407,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 82.1328000020003,
+      "cursor_observed_ms": 82.22480000040377,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 86.81559999968158,
+      "cursor_observed_ms": 86.90810000189231,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 91.21199999935925,
+      "cursor_observed_ms": 91.30379999987781,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 0
+    },
+    {
+      "window_observed_ms": 95.92130000237375,
+      "cursor_observed_ms": 96.0135999994236,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 100.25420000238228,
+      "cursor_observed_ms": 100.37870000087423,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 105.50440000224626,
+      "cursor_observed_ms": 105.62600000048405,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 109.8974000015005,
+      "cursor_observed_ms": 109.97490000227117,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 114.57770000197343,
+      "cursor_observed_ms": 114.70100000224193,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 119.32470000101603,
+      "cursor_observed_ms": 119.50010000145994,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 123.80889999985811,
+      "cursor_observed_ms": 123.89660000189906,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 128.0103000026429,
+      "cursor_observed_ms": 128.09370000104536,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 133.0381000007037,
+      "cursor_observed_ms": 133.12969999969937,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 138.09910000054515,
+      "cursor_observed_ms": 138.18710000123247,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 143.08250000249245,
+      "cursor_observed_ms": 143.16520000284072,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 147.8389000003517,
+      "cursor_observed_ms": 147.9332000017166,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 152.51720000014757,
+      "cursor_observed_ms": 152.64130000286968,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 156.67820000089705,
+      "cursor_observed_ms": 156.76150000217604,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 161.53630000189878,
+      "cursor_observed_ms": 161.62579999945592,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 166.2295999994967,
+      "cursor_observed_ms": 166.32160000153817,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 171.05760000049486,
+      "cursor_observed_ms": 171.14710000168998,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 175.60710000179824,
+      "cursor_observed_ms": 175.6980999998632,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 180.2365000003192,
+      "cursor_observed_ms": 180.38979999982985,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 185.33620000016526,
+      "cursor_observed_ms": 185.51400000069407,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 189.77749999976368,
+      "cursor_observed_ms": 189.86210000002757,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 194.80560000010883,
+      "cursor_observed_ms": 195.04170000072918,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 199.26960000157123,
+      "cursor_observed_ms": 199.35090000217315,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 204.3991000027745,
+      "cursor_observed_ms": 204.49419999931706,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 209.55890000186628,
+      "cursor_observed_ms": 209.676300000865,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    },
+    {
+      "window_observed_ms": 214.01890000197454,
+      "cursor_observed_ms": 214.10440000181552,
+      "overlay": true,
+      "cursor_transparent": true,
+      "journal_entries": 1
+    }
+  ]
+}

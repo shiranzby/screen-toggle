@@ -1,0 +1,57 @@
+{
+  "sha256": "ab1fca8234de7758f89a55a4423c1bff67f404c88386456c7a8bed6251018215",
+  "pass": true,
+  "cases": [
+    {
+      "case": "merged_autostart_silent_only_on_startup_command_manual_always_visible",
+      "pass": true
+    },
+    {
+      "case": "no_scrollbar_with_wheel_keyboard_and_theme_switch",
+      "pass": true
+    },
+    {
+      "case": "quiet_about_content_ok_escape_close_and_resource_release",
+      "pass": true,
+      "gdi_before": 57,
+      "gdi_after": 55,
+      "sound_evidence": "About uses a custom window, not MessageBox/MessageBeep; audio loopback not recorded"
+    }
+  ],
+  "dispatch": "bounded BM_CLICK / Windows messages; actual subprocess startup command",
+  "registry": "private HKCU/Software/ScreenOffGuard/Tests branch",
+  "test_display": {
+    "gdi_device": "\\\\.\\DISPLAY3",
+    "friendly_name": "Type_C",
+    "device_path": "\\\\?\\DISPLAY#RTK1600#5&391a0754&0&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}",
+    "source_id": 2,
+    "target_id": 4352,
+    "output_technology": 10,
+    "connection": "DISPLAYPORT_EXTERNAL",
+    "monitor_rect": [
+      -2000,
+      0,
+      0,
+      3200
+    ],
+    "work_rect": [
+      -2000,
+      0,
+      0,
+      3130
+    ],
+    "primary": false
+  },
+  "startup_command": "\"F:\\WorkSpace\\Myproject\\一键熄屏工具\\artifacts\\sog.exe\" --data-dir \"F:\\WorkSpace\\Myproject\\一键熄屏工具\\checks\\evidence\\startup-v0.3-final\\data\" --ui-test --silent",
+  "exit_code": 0,
+  "covered_controls": [],
+  "screenshots": [
+    "merged-startup-panel.png",
+    "about-from-silent-tray-typec.png",
+    "manual-launch-reveals-running-tray.png",
+    "hidden-scrollbar-bottom-dark.png",
+    "hidden-scrollbar-light.png",
+    "about-light.png",
+    "about-dark.png"
+  ]
+}

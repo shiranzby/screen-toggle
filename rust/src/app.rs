@@ -3,7 +3,8 @@ use crate::{about as about_window, panel as p, theme, win::*};
 use sog::{
     config::*,
     engine::{
-        Backend, Change, ChangeResult, Device, Engine, FileJournal, Inventory, Kind, Outcome,
+        measurement_config, Backend, Change, ChangeResult, Device, Engine, FileJournal, Inventory,
+        Kind, Outcome, PresentationAck, RestoreBatch, ScanRequest,
     },
     native::Native,
     schedule::Schedule,
@@ -17,7 +18,7 @@ use std::{
     mem::size_of,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
     thread,
@@ -59,14 +60,15 @@ struct Options {
     test: bool,
     selftest: bool,
     silent: bool,
+    restrict_id: Option<String>,
     probe: Option<PathBuf>,
     key: String,
 }
 impl Options {
     fn parse() -> Result<Self, String> {
         let mut args = std::env::args().skip(1);
-        let (mut dir, mut test, mut selftest, mut silent, mut probe) =
-            (None, false, false, false, None);
+        let (mut dir, mut test, mut selftest, mut silent, mut probe, mut restrict_id) =
+            (None, false, false, false, None, None);
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--data-dir" => {
@@ -78,6 +80,13 @@ impl Options {
                     test = true;
                 }
                 "--silent" => silent = true,
+                "--restrict-id" => {
+                    let value = args.next().ok_or("--restrict-id 缺少设备身份")?;
+                    if !matches!(value.split_once(':'), Some(("ddc" | "wmi" | "hdr", _))) {
+                        return Err("--restrict-id 必须是 ddc:/wmi:/hdr: 设备身份".into());
+                    }
+                    restrict_id = Some(value);
+                }
                 "--probe" => {
                     probe = Some(PathBuf::from(args.next().ok_or("--probe 缺少输出路径")?))
                 }
@@ -107,6 +116,7 @@ impl Options {
             test,
             selftest,
             silent,
+            restrict_id,
             probe,
         })
     }
@@ -119,6 +129,7 @@ enum Operation {
     Quit,
 }
 struct Work {
+    requested_at: Instant,
     op: Operation,
     cfg: Config,
     generation: u64,
@@ -129,7 +140,7 @@ enum Report {
         generation: u64,
         dark: bool,
         hidden: bool,
-        reply: mpsc::Sender<Result<(), String>>,
+        reply: mpsc::Sender<PresentationAck>,
     },
     Ready(Result<Outcome, String>, bool),
     Hardware {
@@ -422,11 +433,22 @@ struct Presented<B> {
     command_generation: u64,
     op: Operation,
     reveal_delay: u32,
+    reveal_on_write: bool,
     test: bool,
 }
 impl<B: Backend> Backend for Presented<B> {
     fn scan(&mut self) -> Result<Inventory, String> {
         self.inner.scan()
+    }
+    fn scan_required(&mut self, request: ScanRequest) -> Result<Inventory, String> {
+        self.inner.scan_required(request)
+    }
+    fn prepare_restore(
+        &mut self,
+        entries: &[Device],
+        allow_reuse: bool,
+    ) -> Result<Vec<String>, String> {
+        self.inner.prepare_restore(entries, allow_reuse)
     }
     fn read(&mut self, id: &str, kind: Kind) -> Result<u32, String> {
         self.inner.read(id, kind)
@@ -446,6 +468,59 @@ impl<B: Backend> Backend for Presented<B> {
         current: &(dyn Fn() -> bool + Sync),
     ) -> Vec<ChangeResult> {
         self.inner.apply(changes, current)
+    }
+    fn apply_restore(
+        &mut self,
+        changes: &[Change],
+        current: &(dyn Fn() -> bool + Sync),
+        hidden: bool,
+    ) -> RestoreBatch {
+        if !self.reveal_on_write || self.test {
+            return RestoreBatch {
+                changes: self.inner.apply(changes, current),
+                presentation: None,
+            };
+        }
+        let (reply, received) = mpsc::channel();
+        let posted = AtomicBool::new(false);
+        let sender = &self.sender;
+        let owner = self.owner;
+        let generation = self.command_generation;
+        let all_written = || {
+            if current() && !posted.swap(true, Ordering::AcqRel) {
+                // Only post here: the last write lane immediately starts its
+                // read while the UI reveals the desktop independently.
+                wake(
+                    sender,
+                    owner,
+                    Report::Presentation {
+                        generation,
+                        dark: false,
+                        hidden,
+                        reply: reply.clone(),
+                    },
+                );
+            }
+        };
+        let changes = self
+            .inner
+            .apply_with_write_ack(changes, current, &all_written);
+        let presentation = if posted.load(Ordering::Acquire) {
+            Some(
+                received
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| PresentationAck {
+                        result: Err("界面未确认屏幕与光标切换，恢复记录已保留".into()),
+                        at: Instant::now(),
+                    }),
+            )
+        } else {
+            None
+        };
+        RestoreBatch {
+            changes,
+            presentation,
+        }
     }
     fn present(&mut self, dark: bool, hidden: bool) -> Result<(), String> {
         if self.op == Operation::Measure {
@@ -475,7 +550,8 @@ impl<B: Backend> Backend for Presented<B> {
         );
         received
             .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "界面未确认屏幕与光标切换，恢复记录已保留".to_string())??;
+            .map_err(|_| "界面未确认屏幕与光标切换，恢复记录已保留".to_string())?
+            .result?;
         if self.test {
             self.inner.present(dark, hidden)?;
         }
@@ -498,6 +574,7 @@ fn worker<B: Backend>(
         command_generation: 0,
         op: Operation::Light,
         reveal_delay: 0,
+        reveal_on_write: false,
         test: opts.test,
     };
     let mut engine = Engine::new(backend, FileJournal(opts.dir.join("recovery.json")));
@@ -523,6 +600,8 @@ fn worker<B: Backend>(
             Ok(engine) => {
                 engine.backend.command_generation = command.generation;
                 engine.backend.op = command.op;
+                engine.backend.reveal_on_write = command.op == Operation::Light
+                    && command.cfg.restore_mode == RestoreMode::Ready;
                 engine.backend.reveal_delay = if command.op == Operation::Light
                     && command.cfg.restore_mode == RestoreMode::Delay
                 {
@@ -535,11 +614,10 @@ fn worker<B: Backend>(
                     Operation::Light => engine.light(alive),
                     Operation::Quit => engine.light(|| true),
                     Operation::Measure => {
-                        let mut cfg = command.cfg.clone();
-                        cfg.cursor_mode = CursorMode::Keep;
+                        let cfg = measurement_config(&command.cfg);
                         let dark = engine.dark(&cfg, alive);
                         // Even a superseded or failed measurement must restore its baseline.
-                        let light = engine.light(|| true);
+                        let light = engine.light_after_measure(|| true);
                         if opts.isolated {
                             let trace = serde_json::json!({
                                 "generation": command.generation,
@@ -573,6 +651,17 @@ fn worker<B: Backend>(
             unsafe {
                 let _ = SetThreadExecutionState(ES_CONTINUOUS);
             }
+        }
+        if opts.isolated && matches!(command.op, Operation::Dark | Operation::Light) {
+            // Observation runs after the operation; never delay presentation.
+            let trace = serde_json::json!({
+                "generation": command.generation,
+                "operation": if command.op == Operation::Dark { "dark" } else { "light" },
+                "outcome": result.as_ref().ok(), "error": result.as_ref().err(),
+                "pending": pending,
+                "requested_to_complete_ms": command.requested_at.elapsed().as_secs_f64() * 1000.0
+            });
+            let _ = storage::atomic_json(&opts.dir.join("hardware-operation.json"), &trace);
         }
         wake(
             &sender,
@@ -1136,6 +1225,7 @@ unsafe fn request(op: Operation, manual: bool) {
         Some((
             s.work.clone(),
             Work {
+                requested_at: Instant::now(),
                 op,
                 cfg: s.saved.clone(),
                 generation,
@@ -1177,6 +1267,7 @@ unsafe fn begin_exit() {
         Some((
             s.work.clone(),
             Work {
+                requested_at: Instant::now(),
                 op: Operation::Quit,
                 cfg: s.saved.clone(),
                 generation,
@@ -1216,7 +1307,10 @@ unsafe fn receive_reports() {
                 } else {
                     Err("显示切换已被新指令替代".into())
                 };
-                let _ = reply.send(result);
+                let _ = reply.send(PresentationAck {
+                    result,
+                    at: Instant::now(),
+                });
             }
             Report::AutostartError(error) => {
                 feedback(format!("开机自启未能同步：{error}；可重新切换自启重试"));
@@ -1870,8 +1964,16 @@ pub fn run() -> Result<(), String> {
                     worker_gen,
                 );
             } else {
+                let native = worker_opts
+                    .restrict_id
+                    .as_ref()
+                    .map(|id| {
+                        Native::restricted_to(vec![id.clone()])
+                            .expect("validated device restriction")
+                    })
+                    .unwrap_or_else(|| Native::new(false));
                 worker(
-                    Native::new(false),
+                    native,
                     work_rx,
                     worker_reports,
                     address,

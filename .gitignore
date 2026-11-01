@@ -1,4 +1,20 @@
+# Build output and release binaries
 **/target/
 .build/
+.build-*/
 artifacts/
+
+# Local validation and runtime files
+**/__pycache__/
+*.pyc
 *.log
+settings.json
+recovery.json
+status.json
+checks/evidence/**
+!checks/evidence/normal-path-typec-v0.3-final/
+!checks/evidence/normal-path-typec-v0.3-final/*.json
+!checks/evidence/startup-v0.3-final/
+!checks/evidence/startup-v0.3-final/*.json
+!checks/evidence/resources-v0.3-final/
+!checks/evidence/resources-v0.3-final/*.json

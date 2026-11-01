@@ -476,16 +476,16 @@ impl Panel {
             },
             Row {
                 title: "亮屏方式",
-                desc: "恢复亮度后撤除黑窗",
+                desc: "写入成功先亮屏，后台回读确认",
                 group: 2,
                 kind: RowKind::Choice(vec![
-                    (READY, "亮度就绪即撤窗", 190),
+                    (READY, "写入完成即撤窗", 190),
                     (DELAY_MODE, "固定延迟", 126),
                 ]),
             },
             Row {
                 title: "调光耗时",
-                desc: "检测会压暗并恢复屏幕；单位 ms",
+                desc: "固定延迟时，恢复后额外保留黑窗；ms",
                 group: 2,
                 kind: RowKind::Delay,
             },

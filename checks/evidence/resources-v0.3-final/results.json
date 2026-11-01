@@ -1,0 +1,40 @@
+{
+  "exe": "F:\\WorkSpace\\Myproject\\一键熄屏工具\\artifacts\\sog.exe",
+  "sha256": "ab1fca8234de7758f89a55a4423c1bff67f404c88386456c7a8bed6251018215",
+  "native_backend": true,
+  "measurements": [
+    {
+      "scenario": "tray_only_cold",
+      "working_set_bytes": 13901824,
+      "private_commit_bytes": 2494464,
+      "gdi_objects": 10,
+      "user_objects": 7,
+      "handles": 179
+    },
+    {
+      "scenario": "settings_visible",
+      "working_set_bytes": 18116608,
+      "private_commit_bytes": 3256320,
+      "gdi_objects": 45,
+      "user_objects": 59,
+      "handles": 202
+    },
+    {
+      "scenario": "settings_after_50_hide_show",
+      "working_set_bytes": 18382848,
+      "private_commit_bytes": 3362816,
+      "gdi_objects": 45,
+      "user_objects": 59,
+      "handles": 202
+    },
+    {
+      "scenario": "tray_after_settings_hidden",
+      "working_set_bytes": 18382848,
+      "private_commit_bytes": 3362816,
+      "gdi_objects": 45,
+      "user_objects": 59,
+      "handles": 202
+    }
+  ],
+  "pass": true
+}

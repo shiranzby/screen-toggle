@@ -5,6 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -28,6 +29,50 @@ pub struct Device {
 pub struct Inventory {
     pub devices: Vec<Device>,
     pub warnings: Vec<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanRequest {
+    pub external: bool,
+    pub internal: bool,
+    pub hdr: bool,
+}
+impl ScanRequest {
+    pub const fn all() -> Self {
+        Self {
+            external: true,
+            internal: true,
+            hdr: true,
+        }
+    }
+    pub fn from_config(cfg: &Config) -> Self {
+        Self {
+            external: cfg.dim_external,
+            internal: cfg.dim_internal,
+            hdr: cfg.hdr_off,
+        }
+    }
+    pub fn from_devices(devices: &[Device]) -> Self {
+        Self {
+            external: devices.iter().any(|d| d.kind == Kind::External),
+            internal: devices.iter().any(|d| d.kind == Kind::Internal),
+            hdr: devices.iter().any(|d| d.kind == Kind::Hdr),
+        }
+    }
+    pub fn includes(self, kind: Kind) -> bool {
+        match kind {
+            Kind::External => self.external,
+            Kind::Internal => self.internal,
+            Kind::Hdr => self.hdr,
+        }
+    }
+}
+/// Measurement has no presentation side effects. Avoid the early UI-only
+/// journal while retaining the full baseline commit before hardware writes.
+pub fn measurement_config(cfg: &Config) -> Config {
+    let mut measurement = cfg.clone();
+    measurement.cursor_mode = CursorMode::Keep;
+    measurement.dim_order = DimOrder::DimFirst;
+    measurement
 }
 #[derive(Clone, Debug)]
 pub struct Change {
@@ -77,8 +122,80 @@ impl ChangeResult {
         }
     }
 }
+pub struct PresentationAck {
+    pub result: Result<(), String>,
+    pub at: Instant,
+}
+pub struct RestoreBatch {
+    pub changes: Vec<ChangeResult>,
+    pub presentation: Option<PresentationAck>,
+}
+/// Every requested change counts, including unavailable or rejected devices.
+/// Notification is only for successful writes, never a readiness assertion.
+pub(crate) struct WriteAcknowledgements<'a> {
+    remaining: AtomicUsize,
+    notified: AtomicBool,
+    current: &'a (dyn Fn() -> bool + Sync),
+    all_written: &'a (dyn Fn() + Sync),
+}
+impl<'a> WriteAcknowledgements<'a> {
+    pub(crate) fn new(
+        count: usize,
+        current: &'a (dyn Fn() -> bool + Sync),
+        all_written: &'a (dyn Fn() + Sync),
+    ) -> Self {
+        Self {
+            remaining: AtomicUsize::new(count),
+            notified: AtomicBool::new(false),
+            current,
+            all_written,
+        }
+    }
+    pub(crate) fn success(&self) {
+        if !(self.current)() {
+            return;
+        }
+        loop {
+            let remaining = self.remaining.load(Ordering::Acquire);
+            if remaining == 0 {
+                return;
+            }
+            if self
+                .remaining
+                .compare_exchange(
+                    remaining,
+                    remaining - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                if remaining == 1 && (self.current)() && !self.notified.swap(true, Ordering::AcqRel)
+                {
+                    (self.all_written)();
+                }
+                return;
+            }
+        }
+    }
+}
 pub trait Backend {
     fn scan(&mut self) -> Result<Inventory, String>;
+    fn scan_required(&mut self, request: ScanRequest) -> Result<Inventory, String> {
+        let mut inventory = self.scan()?;
+        inventory.devices.retain(|d| request.includes(d.kind));
+        Ok(inventory)
+    }
+    /// Reuse is permitted only for the immediate restore in one measurement.
+    /// Default backends keep the full refresh; Native validates topology first.
+    fn prepare_restore(
+        &mut self,
+        entries: &[Device],
+        _allow_reuse: bool,
+    ) -> Result<Vec<String>, String> {
+        self.scan_required(ScanRequest::from_devices(entries))
+            .map(|i| i.warnings)
+    }
     fn write(&mut self, id: &str, kind: Kind, value: u32) -> Result<(), String>;
     fn read(&mut self, id: &str, kind: Kind) -> Result<u32, String>;
     fn cursor(&mut self, hidden: bool) -> Result<(), String>;
@@ -112,6 +229,43 @@ pub trait Backend {
                 )
             })
             .collect()
+    }
+    fn apply_internal(
+        &mut self,
+        changes: &[Change],
+        current: &(dyn Fn() -> bool + Sync),
+        _all_written: Option<&(dyn Fn() + Sync)>,
+    ) -> Vec<ChangeResult> {
+        self.apply(changes, current)
+    }
+    /// Native notifies after all writes, while confirmation reads continue.
+    /// Generic backends safely fall back to their complete apply contract.
+    fn apply_with_write_ack(
+        &mut self,
+        changes: &[Change],
+        current: &(dyn Fn() -> bool + Sync),
+        all_written: &(dyn Fn() + Sync),
+    ) -> Vec<ChangeResult> {
+        let results = self.apply(changes, current);
+        if !changes.is_empty()
+            && results.len() == changes.len()
+            && results.iter().all(|r| matches!(r.result, Ok(true)))
+            && current()
+        {
+            all_written();
+        }
+        results
+    }
+    fn apply_restore(
+        &mut self,
+        changes: &[Change],
+        current: &(dyn Fn() -> bool + Sync),
+        _hidden: bool,
+    ) -> RestoreBatch {
+        RestoreBatch {
+            changes: self.apply(changes, current),
+            presentation: None,
+        }
     }
 }
 pub(crate) fn confirm_change<T: ?Sized>(
@@ -192,8 +346,19 @@ pub(crate) fn confirm_change_after_snapshot<T: ?Sized>(
     change: &Change,
     current: &(dyn Fn() -> bool + Sync),
     batch_start: Instant,
+    read: impl FnMut(&mut T) -> Result<u32, String>,
+    write: impl FnMut(&mut T, u32) -> Result<(), String>,
+) -> ChangeResult {
+    confirm_change_after_snapshot_with_ack(state, change, current, batch_start, read, write, &|| {})
+}
+pub(crate) fn confirm_change_after_snapshot_with_ack<T: ?Sized>(
+    state: &mut T,
+    change: &Change,
+    current: &(dyn Fn() -> bool + Sync),
+    batch_start: Instant,
     mut read: impl FnMut(&mut T) -> Result<u32, String>,
     mut write: impl FnMut(&mut T, u32) -> Result<(), String>,
+    written: &(dyn Fn() + Sync),
 ) -> ChangeResult {
     let started = Instant::now();
     let write_start = Instant::now();
@@ -205,9 +370,14 @@ pub(crate) fn confirm_change_after_snapshot<T: ?Sized>(
         if !current() {
             return Ok(false);
         }
-        let written = write(state, change.value);
+        let write_result = write(state, change.value);
         write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
-        written?;
+        write_result?;
+        if !current() {
+            return Ok(false);
+        }
+        // Posting presentation must not wait for UI or defer this lane's read.
+        written();
         let verify_start = Instant::now();
         loop {
             if !current() {
@@ -297,6 +467,8 @@ pub struct Outcome {
     /// Discovery/cursor preparation and journal persistence outside the batches.
     pub prepare_ms: u32,
     pub total_ms: u32,
+    /// Engine start to acknowledged UI transition; not physical panel response.
+    pub presentation_ms: Option<f64>,
     pub changes: Vec<ChangeResult>,
 }
 pub struct Engine<B, J> {
@@ -366,6 +538,7 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
         }
         if cfg.dim_order != DimOrder::DimFirst {
             self.backend.present(true, hide)?;
+            out.presentation_ms = Some(total.elapsed().as_secs_f64() * 1000.0);
         }
         if !current() {
             out.superseded = true;
@@ -373,7 +546,7 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
             out.total_ms = out.prepare_ms;
             return Ok(out);
         }
-        let inventory = self.backend.scan()?;
+        let inventory = self.backend.scan_required(ScanRequest::from_config(cfg))?;
         out.warnings = inventory.warnings;
         journal.entries = inventory
             .devices
@@ -403,10 +576,11 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
         self.journal = Some(journal.clone());
         out.prepare_ms = milliseconds(total.elapsed());
         let start = Instant::now();
-        self.apply_groups(&journal.entries, false, &current, &mut out);
+        self.apply_groups(&journal.entries, false, &current, &mut out, None);
         out.elapsed_ms = milliseconds(start.elapsed());
         if cfg.dim_order == DimOrder::DimFirst && current() {
             self.backend.present(true, hide)?;
+            out.presentation_ms = Some(total.elapsed().as_secs_f64() * 1000.0);
         }
         out.superseded |= !current();
         if out.channels == 0 && (cfg.dim_internal || cfg.dim_external) {
@@ -417,6 +591,21 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
         Ok(out)
     }
     pub fn light(&mut self, current: impl Fn() -> bool + Sync) -> Result<Outcome, String> {
+        self.restore(current, false)
+    }
+    /// The caller has just completed this measurement's dark phase, including
+    /// joining every hardware lane; cancellation still requires restoration.
+    pub fn light_after_measure(
+        &mut self,
+        current: impl Fn() -> bool + Sync,
+    ) -> Result<Outcome, String> {
+        self.restore(current, true)
+    }
+    fn restore(
+        &mut self,
+        current: impl Fn() -> bool + Sync,
+        allow_reuse: bool,
+    ) -> Result<Outcome, String> {
         let total = Instant::now();
         let Some(journal) = self.journal.clone() else {
             return Ok(Outcome::default());
@@ -425,22 +614,44 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
         let mut remaining = journal.clone();
         // Reacquire by identity, never by monitor order or by a saved HANDLE.
         if !journal.entries.is_empty() {
-            let inventory = self.backend.scan()?;
-            out.warnings.extend(inventory.warnings);
+            out.warnings.extend(
+                self.backend
+                    .prepare_restore(&journal.entries, allow_reuse)?,
+            );
         }
         out.prepare_ms = milliseconds(total.elapsed());
         let start = Instant::now();
-        self.apply_groups(&journal.entries, true, &current, &mut out);
+        let early = self.apply_groups(
+            &journal.entries,
+            true,
+            &current,
+            &mut out,
+            if allow_reuse {
+                None
+            } else {
+                Some(journal.cursor_hidden)
+            },
+        );
         out.elapsed_ms = milliseconds(start.elapsed());
-        // Keep the cursor hidden through the whole restore (including any UI
-        // reveal delay). The UI acknowledges both changes together.
         let mut presentation_confirmed = false;
-        if current() {
+        if let Some(ack) = early {
+            match ack.result {
+                Ok(()) => {
+                    remaining.cursor_hidden = false;
+                    presentation_confirmed = true;
+                    out.presentation_ms = Some(ack.at.duration_since(total).as_secs_f64() * 1000.0);
+                }
+                Err(e) => out.warnings.push(e),
+            }
+        } else if current() {
+            // Delay mode and failed-write batches retain the complete-confirm
+            // fallback. Both visible transitions still share one UI dispatch.
             let presentation = Instant::now();
             match self.backend.present(false, journal.cursor_hidden) {
                 Ok(()) => {
                     remaining.cursor_hidden = false;
                     presentation_confirmed = true;
+                    out.presentation_ms = Some(total.elapsed().as_secs_f64() * 1000.0);
                 }
                 Err(e) => out.warnings.push(e),
             }
@@ -476,7 +687,8 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
         restoring: bool,
         current: &(dyn Fn() -> bool + Sync),
         out: &mut Outcome,
-    ) {
+        reveal: Option<bool>,
+    ) -> Option<PresentationAck> {
         let (hdr, brightness): (Vec<_>, Vec<_>) = devices
             .iter()
             .map(|device| Change {
@@ -486,7 +698,9 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
             .partition(|change| change.device.kind == Kind::Hdr);
         // HDR may change a display's topology. Finish its entire batch before
         // dispatching brightness, and never overlap separate Engine operations.
-        for changes in [hdr, brightness] {
+        let mut presentation = None;
+        let mut hdr_confirmed = true;
+        for (stage, changes) in [hdr, brightness].into_iter().enumerate() {
             if !current() {
                 out.superseded = true;
                 break;
@@ -496,7 +710,18 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
             }
             let group_started = out.elapsed_ms;
             let batch = Instant::now();
-            for result in self.backend.apply(&changes, current) {
+            let results = if let Some(hidden) = reveal.filter(|_| stage == 1 && hdr_confirmed) {
+                let restored = self.backend.apply_restore(&changes, current, hidden);
+                presentation = restored.presentation;
+                restored.changes
+            } else {
+                self.backend.apply(&changes, current)
+            };
+            if stage == 0 {
+                hdr_confirmed = results.len() == changes.len()
+                    && results.iter().all(|r| matches!(r.result, Ok(true)));
+            }
+            for result in results {
                 out.write_ms = out.write_ms.max(
                     (f64::from(group_started) + result.started_ms + result.write_ms)
                         .ceil()
@@ -512,6 +737,7 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
             out.elapsed_ms = out.elapsed_ms.saturating_add(milliseconds(batch.elapsed()));
         }
         out.superseded |= !current();
+        presentation
     }
 }
 fn milliseconds(duration: Duration) -> u32 {
@@ -526,7 +752,7 @@ mod tests {
         collections::BTreeMap,
         rc::Rc,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
     };
@@ -637,6 +863,166 @@ mod tests {
         fn remote_active(&self) -> bool {
             self.remote
         }
+    }
+    struct RequestedAudit {
+        inner: Fake,
+        store: Rc<MemoryStore>,
+        requests: Vec<ScanRequest>,
+        restores: Vec<(ScanRequest, bool)>,
+    }
+    impl Backend for RequestedAudit {
+        fn scan(&mut self) -> Result<Inventory, String> {
+            panic!("Engine must pass the requested hardware kinds before scanning")
+        }
+        fn scan_required(&mut self, request: ScanRequest) -> Result<Inventory, String> {
+            self.requests.push(request);
+            self.inner.scan_required(request)
+        }
+        fn prepare_restore(
+            &mut self,
+            entries: &[Device],
+            allow_reuse: bool,
+        ) -> Result<Vec<String>, String> {
+            self.restores
+                .push((ScanRequest::from_devices(entries), allow_reuse));
+            self.inner.prepare_restore(entries, allow_reuse)
+        }
+        fn write(&mut self, id: &str, kind: Kind, value: u32) -> Result<(), String> {
+            assert!(
+                self.store
+                    .saved
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|j| j.entries.iter().any(|d| d.id == id && d.kind == kind)),
+                "baseline must be durable before write"
+            );
+            self.inner.write(id, kind, value)
+        }
+        fn read(&mut self, id: &str, kind: Kind) -> Result<u32, String> {
+            self.inner.read(id, kind)
+        }
+        fn cursor(&mut self, hidden: bool) -> Result<(), String> {
+            self.inner.cursor(hidden)
+        }
+        fn remote_active(&self) -> bool {
+            false
+        }
+    }
+    #[test]
+    fn measurement_commits_one_complete_baseline_and_restores_even_after_cancel() {
+        for order in [DimOrder::BlackFirst, DimOrder::Fade, DimOrder::DimFirst] {
+            let store = Rc::new(MemoryStore::default());
+            let backend = RequestedAudit {
+                inner: Fake::default(),
+                store: store.clone(),
+                requests: vec![],
+                restores: vec![],
+            };
+            let mut engine = Engine::new(backend, store.clone()).unwrap();
+            let original = Config {
+                dim_order: order,
+                cursor_mode: CursorMode::Hide,
+                hdr_off: false,
+                ..Config::default()
+            };
+            let cfg = measurement_config(&original);
+            assert_eq!(original.dim_order, order);
+            assert_eq!(original.cursor_mode, CursorMode::Hide);
+            assert_eq!(cfg.dim_order, DimOrder::DimFirst);
+            assert_eq!(cfg.cursor_mode, CursorMode::Keep);
+            let live = Arc::new(AtomicBool::new(true));
+            engine.backend.inner.cancel = Some(live.clone());
+            let out = engine.dark(&cfg, || live.load(Ordering::Acquire)).unwrap();
+            assert!(out.superseded);
+            assert_eq!(store.saves.get(), 1);
+            assert!(store
+                .saved
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .all(|d| d.kind == Kind::External));
+            engine.backend.inner.cancel = None;
+            engine.light_after_measure(|| true).unwrap();
+            assert_eq!(engine.backend.inner.values["same-model/serial-b"], 76);
+            assert_eq!(engine.backend.inner.values["hdr-a"], 1);
+            assert!(!engine.has_pending_recovery());
+            assert_eq!(
+                engine.backend.requests,
+                vec![ScanRequest {
+                    external: true,
+                    internal: true,
+                    hdr: false
+                }]
+            );
+            assert_eq!(
+                engine.backend.restores,
+                vec![(
+                    ScanRequest {
+                        external: true,
+                        internal: false,
+                        hdr: false
+                    },
+                    true
+                )]
+            );
+        }
+    }
+    #[test]
+    fn measurement_failed_full_baseline_never_writes_hardware() {
+        let store = Rc::new(MemoryStore::default());
+        store.fail.set(true);
+        let mut engine = Engine::new(Fake::default(), store.clone()).unwrap();
+        assert!(engine
+            .dark(&measurement_config(&Config::default()), || true)
+            .is_err());
+        assert_eq!(store.saves.get(), 1);
+        assert!(engine.backend.writes.is_empty());
+        assert!(!engine.backend.cursor);
+        assert!(!engine.has_pending_recovery());
+    }
+    #[test]
+    fn restore_request_uses_original_journal_kinds_and_never_assumes_fast_reuse() {
+        let store = Rc::new(MemoryStore::default());
+        let backend = RequestedAudit {
+            inner: Fake::default(),
+            store: store.clone(),
+            requests: vec![],
+            restores: vec![],
+        };
+        let mut engine = Engine::new(backend, store).unwrap();
+        let cfg = Config {
+            dim_external: false,
+            dim_internal: false,
+            hdr_off: true,
+            cursor_mode: CursorMode::Keep,
+            ..Config::default()
+        };
+        engine.dark(&cfg, || true).unwrap();
+        assert_eq!(
+            engine.backend.requests,
+            vec![ScanRequest {
+                external: false,
+                internal: false,
+                hdr: true
+            }]
+        );
+        assert_eq!(engine.backend.inner.values["same-model/serial-b"], 76);
+        engine.light(|| true).unwrap();
+        assert_eq!(
+            engine.backend.restores,
+            vec![(
+                ScanRequest {
+                    external: false,
+                    internal: false,
+                    hdr: true
+                },
+                false
+            )]
+        );
+        assert_eq!(engine.backend.inner.values["hdr-a"], 1);
+        assert!(!engine.has_pending_recovery());
     }
     #[test]
     fn baseline_zero_and_duplicate_names_restore_by_identity() {
@@ -1115,5 +1501,53 @@ mod tests {
         assert_eq!(result.verify_reads, 0);
         assert_eq!(result.verify_ms, 0.0);
         assert_eq!(result.wait_ms, 0.0);
+    }
+    #[test]
+    fn write_ack_requires_every_requested_change_and_fires_once() {
+        let current = AtomicBool::new(true);
+        let notified = AtomicUsize::new(0);
+        let current_check = || current.load(Ordering::Acquire);
+        let all_written = || {
+            notified.fetch_add(1, Ordering::AcqRel);
+        };
+        let ack = WriteAcknowledgements::new(3, &current_check, &all_written);
+        ack.success();
+        ack.success();
+        assert_eq!(notified.load(Ordering::Acquire), 0);
+        ack.success();
+        ack.success();
+        assert_eq!(notified.load(Ordering::Acquire), 1);
+        current.store(false, Ordering::Release);
+        ack.success();
+        assert_eq!(notified.load(Ordering::Acquire), 1);
+    }
+    #[test]
+    fn write_ack_is_posted_before_confirmation_read() {
+        let change = Change {
+            device: Fake::default().scan().unwrap().devices.remove(0),
+            value: 0,
+        };
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_events = events.clone();
+        let written = || callback_events.lock().unwrap().push("ack");
+        let mut state = 75;
+        let result = confirm_change_after_snapshot_with_ack(
+            &mut state,
+            &change,
+            &|| true,
+            Instant::now(),
+            |state| {
+                events.lock().unwrap().push("read");
+                Ok(*state)
+            },
+            |state, value| {
+                events.lock().unwrap().push("write");
+                *state = value;
+                Ok(())
+            },
+            &written,
+        );
+        assert!(matches!(result.result, Ok(true)));
+        assert_eq!(*events.lock().unwrap(), ["write", "ack", "read"]);
     }
 }

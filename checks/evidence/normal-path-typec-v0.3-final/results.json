@@ -1,0 +1,120 @@
+{
+  "exe": "F:\\WorkSpace\\Myproject\\一键熄屏工具\\artifacts\\sog.exe",
+  "sha256": "ab1fca8234de7758f89a55a4423c1bff67f404c88386456c7a8bed6251018215",
+  "pass": true,
+  "rounds": [
+    {
+      "round": 1,
+      "pass": true,
+      "baselines_equal": true,
+      "dark": {
+        "operation": "dark",
+        "generation": 1,
+        "pass": true,
+        "dispatch_return_ms": 0.08650000017951243,
+        "observed_presentation_ms": 16.884100001334446,
+        "trace_observed_ms": 215.1134000014281,
+        "presentation_ms": 20.275399999999998,
+        "requested_to_complete_ms": 212.2199,
+        "hardware_ms": 118,
+        "write_ms": 56,
+        "prepare_ms": 94,
+        "total_ms": 212,
+        "start_spread_ms": 0.0,
+        "all_three_overlap_ms": 116.9422
+      },
+      "light": {
+        "operation": "light",
+        "generation": 2,
+        "pass": true,
+        "dispatch_return_ms": 1.5802999987499788,
+        "observed_presentation_ms": 155.97709999929066,
+        "trace_observed_ms": 195.65469999724883,
+        "presentation_ms": 160.3765,
+        "requested_to_complete_ms": 191.6497,
+        "hardware_ms": 122,
+        "write_ms": 61,
+        "prepare_ms": 69,
+        "total_ms": 191,
+        "start_spread_ms": 0.0,
+        "all_three_overlap_ms": 121.512
+      }
+    }
+  ],
+  "config": {
+    "schema_version": 1,
+    "hotkey": {
+      "modifiers": 3,
+      "key": 120
+    },
+    "close_action": "exit",
+    "autostart": false,
+    "dim_internal": true,
+    "dim_external": true,
+    "hdr_off": false,
+    "cursor_mode": "hide",
+    "dim_order": "black_first",
+    "restore_mode": "ready",
+    "delay_ms": 0
+  },
+  "scope": "Authorized native normal Dark/Light; optional fail-closed device restriction; HDR unchanged",
+  "dispatch": "Bounded WM_COMMAND 1001 on hidden controller; private data; no input",
+  "timing_boundaries": {
+    "presentation_ms": "Engine start to UI acknowledgement; not physical panel response",
+    "observed_presentation_ms": "Toggle dispatch to first target overlay visibility sample",
+    "requested_to_complete_ms": "Application request to completed Engine outcome",
+    "trace_observed_ms": "Toggle dispatch to completed-operation trace readable, including observer overhead",
+    "hardware_ms": "Hardware batch wall time including exact read-back; no discovery/journal",
+    "write_ms": "Slowest write return in hardware batch; not read-back completion"
+  },
+  "cursor_before": {
+    "transparent": false,
+    "width": 32,
+    "height": 32,
+    "color": true,
+    "mask_sha256": "7bb6bacd8b8a0d6b9ea34c568dfad18fafa42ff0bd75eb6259d259993a048d44"
+  },
+  "presentation_trace": [
+    {
+      "created_ms": 2.1353,
+      "cursor_ms": 7.0254,
+      "dark": true,
+      "generation": 1,
+      "hidden": true,
+      "simulated": false,
+      "window_ms": 9.1053
+    },
+    {
+      "cursor_ms": 23.543499999999998,
+      "dark": false,
+      "generation": 2,
+      "hidden": false,
+      "simulated": false,
+      "window_ms": 25.0199
+    }
+  ],
+  "medians": {
+    "dark": {
+      "presentation_ms": 20.275399999999998,
+      "observed_presentation_ms": 16.884100001334446,
+      "requested_to_complete_ms": 212.2199,
+      "hardware_ms": 118,
+      "write_ms": 56,
+      "prepare_ms": 94,
+      "total_ms": 212
+    },
+    "light": {
+      "presentation_ms": 160.3765,
+      "observed_presentation_ms": 155.97709999929066,
+      "requested_to_complete_ms": 191.6497,
+      "hardware_ms": 122,
+      "write_ms": 61,
+      "prepare_ms": 69,
+      "total_ms": 191
+    }
+  },
+  "exit_code": 0,
+  "pending_recovery": false,
+  "baselines_equal_after_exit": true,
+  "cursor_equal_after_exit": true
+}

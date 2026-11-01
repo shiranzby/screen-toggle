@@ -14,7 +14,7 @@ use windows::{
     },
 };
 
-pub const FIRST_LINE: &str = "一键熄屏 · Rust 0.2.0";
+pub const FIRST_LINE: &str = "一键熄屏 · Rust 0.3.0";
 const DESCRIPTION: &str = "本应用使用 Rust 编写，通过 Windows 接口实现软件熄屏。\r\n\r\n熄屏时覆盖全屏黑窗，并通过 DDC/CI 调低外接屏、通过 WMI 调低内置屏背光。黑窗可穿透点击，并从屏幕捕获中排除，便于远程操作。\r\n\r\n亮屏时恢复熄屏前的亮度和光标；启用关闭 HDR 时，也会还原原有 HDR 状态。\r\n\r\n使用设置中的全局热键或托盘菜单切换，再次执行即可恢复屏幕。显示器需支持相应的亮度接口，调低背光并非切断电源。";
 struct About {
     owner: HWND,
