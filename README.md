@@ -1,4 +1,4 @@
-# screen-toggle v0.1.0
+# screen-toggle v0.2.0
 
 Rust / Win32 一键熄屏工具的历史源码快照。此标签的 `rust/` 对应该版本，当前版本请访问 [main](https://github.com/shiranzby/screen-toggle)。
 
@@ -18,6 +18,6 @@ cargo check --locked --manifest-path .\rust\Cargo.toml
 cargo build --release --locked --manifest-path .\rust\Cargo.toml
 ```
 
-已完成源码编译检查，未重做历史版本的界面和硬件验收。该版本保留原有编译警告。归档源码与早期用户提供的 EXE 没有逐字节构建一致性保证。
+已完成源码编译检查，未重做历史版本的界面和硬件验收。归档源码与早期用户提供的 EXE 没有逐字节构建一致性保证。
 
 作者：[shiranzby](https://github.com/shiranzby)。
