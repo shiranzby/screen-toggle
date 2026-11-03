@@ -1,9 +1,10 @@
 use crate::{
-    config::{Config, CursorMode, DimOrder},
+    config::{display_is_selected, Config, CursorMode, DimOrder},
     storage,
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     path::PathBuf,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
@@ -93,6 +94,8 @@ pub struct ChangeResult {
     pub verify_ms: f64,
     pub verify_reads: usize,
     pub wait_ms: f64,
+    /// One on the normal path; a recovery fault permits one fresh-binding retry.
+    pub attempts: usize,
     /// true is independently confirmed; false means superseded before confirmation.
     pub result: Result<bool, String>,
 }
@@ -118,6 +121,7 @@ impl ChangeResult {
             verify_ms: 0.0,
             verify_reads: 0,
             wait_ms: 0.0,
+            attempts: 1,
             result,
         }
     }
@@ -186,6 +190,19 @@ pub trait Backend {
         inventory.devices.retain(|d| request.includes(d.kind));
         Ok(inventory)
     }
+    /// Generic/simulated backends filter their inventory. Native overrides this
+    /// before device access; a post-scan filter would not isolate real hardware.
+    fn scan_selected(
+        &mut self,
+        request: ScanRequest,
+        selected: Option<&[String]>,
+    ) -> Result<Inventory, String> {
+        let mut inventory = self.scan_required(request)?;
+        inventory
+            .devices
+            .retain(|device| display_is_selected(&device.id, selected));
+        Ok(inventory)
+    }
     /// Reuse is permitted only for the immediate restore in one measurement.
     /// Default backends keep the full refresh; Native validates topology first.
     fn prepare_restore(
@@ -195,6 +212,11 @@ pub trait Backend {
     ) -> Result<Vec<String>, String> {
         self.scan_required(ScanRequest::from_devices(entries))
             .map(|i| i.warnings)
+    }
+    /// HDR can invalidate display resources. Rebind brightness by the journal's
+    /// identities without replacing the saved values with current dim values.
+    fn rebind_brightness(&mut self, entries: &[Device]) -> Result<Vec<String>, String> {
+        self.prepare_restore(entries, false)
     }
     fn write(&mut self, id: &str, kind: Kind, value: u32) -> Result<(), String>;
     fn read(&mut self, id: &str, kind: Kind) -> Result<u32, String>;
@@ -416,6 +438,24 @@ pub struct Journal {
     pub entries: Vec<Device>,
     pub cursor_hidden: bool,
 }
+impl Journal {
+    fn validate(&self) -> Result<(), String> {
+        let mut identities = BTreeSet::new();
+        if self.version != 1
+            || self.entries.iter().any(|d| {
+                d.id.is_empty()
+                    || !identities.insert((d.kind, d.id.to_ascii_lowercase()))
+                    || d.min > d.value
+                    || d.value > d.max
+                    || (d.kind == Kind::Hdr && (d.min != 0 || d.max != 1))
+                    || (d.kind == Kind::Internal && (d.min != 0 || d.max != 100))
+            })
+        {
+            return Err("恢复记录的设备身份或亮度范围无效，原始记录已保留".into());
+        }
+        Ok(())
+    }
+}
 pub trait JournalStore {
     fn load(&self) -> Result<Option<Journal>, String>;
     fn save(&self, journal: &Journal) -> Result<(), String>;
@@ -428,16 +468,7 @@ impl JournalStore for FileJournal {
             Ok(s) => {
                 let j: Journal = serde_json::from_str(&s)
                     .map_err(|e| format!("恢复记录损坏，原文件已保留：{e}"))?;
-                if j.version != 1
-                    || j.entries.iter().any(|d| {
-                        d.id.is_empty()
-                            || d.min > d.value
-                            || d.value > d.max
-                            || (d.kind == Kind::Hdr && (d.min != 0 || d.max != 1))
-                    })
-                {
-                    return Err("恢复记录无效，不能猜测屏幕原状态".into());
-                }
+                j.validate()?;
                 Ok(Some(j))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -445,6 +476,7 @@ impl JournalStore for FileJournal {
         }
     }
     fn save(&self, j: &Journal) -> Result<(), String> {
+        j.validate()?;
         storage::atomic_json(&self.0, j)
     }
     fn clear(&self) -> Result<(), String> {
@@ -546,7 +578,10 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
             out.total_ms = out.prepare_ms;
             return Ok(out);
         }
-        let inventory = self.backend.scan_required(ScanRequest::from_config(cfg))?;
+        let inventory = self.backend.scan_selected(
+            ScanRequest::from_config(cfg),
+            cfg.selected_displays.as_deref(),
+        )?;
         out.warnings = inventory.warnings;
         journal.entries = inventory
             .devices
@@ -557,13 +592,7 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
                 Kind::Hdr => cfg.hdr_off && d.value != 0,
             })
             .collect();
-        if journal
-            .entries
-            .iter()
-            .any(|d| d.min > d.value || d.value > d.max)
-        {
-            return Err("亮度回读超出设备范围，已中止调光".into());
-        }
+        journal.validate()?;
         if !current() {
             out.superseded = true;
             out.prepare_ms = milliseconds(total.elapsed());
@@ -575,9 +604,7 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
         self.store.save(&journal)?;
         self.journal = Some(journal.clone());
         out.prepare_ms = milliseconds(total.elapsed());
-        let start = Instant::now();
         self.apply_groups(&journal.entries, false, &current, &mut out, None);
-        out.elapsed_ms = milliseconds(start.elapsed());
         if cfg.dim_order == DimOrder::DimFirst && current() {
             self.backend.present(true, hide)?;
             out.presentation_ms = Some(total.elapsed().as_secs_f64() * 1000.0);
@@ -591,7 +618,24 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
         Ok(out)
     }
     pub fn light(&mut self, current: impl Fn() -> bool + Sync) -> Result<Outcome, String> {
-        self.restore(current, false)
+        let first = self.restore(&current, false)?;
+        if !current()
+            || !self.has_pending_recovery()
+            || !first.changes.iter().any(|r| r.result.is_err())
+        {
+            return Ok(first);
+        }
+        // Healthy restores take one pass. Only failed devices/dependencies
+        // remain in the journal and get one fresh binding before a retry.
+        // The successful-write presentation of the first pass is never delayed.
+        match self.restore(&current, false) {
+            Ok(retry) => Ok(merge_restore_attempts(first, retry)),
+            Err(error) => {
+                let mut first = first;
+                first.warnings.push(format!("重新绑定恢复未完成：{error}"));
+                Ok(first)
+            }
+        }
     }
     /// The caller has just completed this measurement's dark phase, including
     /// joining every hardware lane; cancellation still requires restoration.
@@ -613,14 +657,22 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
         let mut out = Outcome::default();
         let mut remaining = journal.clone();
         // Reacquire by identity, never by monitor order or by a saved HANDLE.
-        if !journal.entries.is_empty() {
-            out.warnings.extend(
-                self.backend
-                    .prepare_restore(&journal.entries, allow_reuse)?,
-            );
+        let hdr_entries: Vec<_> = journal
+            .entries
+            .iter()
+            .filter(|d| d.kind == Kind::Hdr)
+            .cloned()
+            .collect();
+        let prepare = if hdr_entries.is_empty() {
+            &journal.entries
+        } else {
+            &hdr_entries
+        };
+        if !prepare.is_empty() {
+            out.warnings
+                .extend(self.backend.prepare_restore(prepare, allow_reuse)?);
         }
         out.prepare_ms = milliseconds(total.elapsed());
-        let start = Instant::now();
         let early = self.apply_groups(
             &journal.entries,
             true,
@@ -632,7 +684,6 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
                 Some(journal.cursor_hidden)
             },
         );
-        out.elapsed_ms = milliseconds(start.elapsed());
         let mut presentation_confirmed = false;
         if let Some(ack) = early {
             match ack.result {
@@ -660,8 +711,18 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
                 .saturating_add(milliseconds(presentation.elapsed()));
         }
         out.superseded |= !current();
+        // A later HDR retry can reset brightness that was already confirmed.
+        // Keep those original values until every HDR dependency is restored.
+        let hdr_pending = journal.entries.iter().any(|device| {
+            device.kind == Kind::Hdr
+                && !out.changes.iter().any(|result| {
+                    result.id == device.id
+                        && result.kind == Kind::Hdr
+                        && matches!(result.result, Ok(true))
+                })
+        });
         for result in &out.changes {
-            if matches!(result.result, Ok(true)) {
+            if matches!(result.result, Ok(true)) && !(hdr_pending && result.kind != Kind::Hdr) {
                 remaining
                     .entries
                     .retain(|d| d.id != result.id || d.kind != result.kind);
@@ -700,6 +761,7 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
         // dispatching brightness, and never overlap separate Engine operations.
         let mut presentation = None;
         let mut hdr_confirmed = true;
+        let hdr_requested = !hdr.is_empty();
         for (stage, changes) in [hdr, brightness].into_iter().enumerate() {
             if !current() {
                 out.superseded = true;
@@ -707,6 +769,27 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
             }
             if changes.is_empty() {
                 continue;
+            }
+            if stage == 1 && hdr_requested {
+                let entries: Vec<_> = changes.iter().map(|c| c.device.clone()).collect();
+                let started = Instant::now();
+                let rebound = self.backend.rebind_brightness(&entries);
+                out.prepare_ms = out
+                    .prepare_ms
+                    .saturating_add(milliseconds(started.elapsed()));
+                match rebound {
+                    Ok(warnings) => out.warnings.extend(warnings),
+                    Err(error) => {
+                        // Retain every original brightness record; never run a
+                        // batch against resources from before the HDR change.
+                        out.warnings.push(error);
+                        break;
+                    }
+                }
+                if !current() {
+                    out.superseded = true;
+                    break;
+                }
             }
             let group_started = out.elapsed_ms;
             let batch = Instant::now();
@@ -739,6 +822,56 @@ impl<B: Backend, J: JournalStore> Engine<B, J> {
         out.superseded |= !current();
         presentation
     }
+}
+fn merge_restore_attempts(mut first: Outcome, retry: Outcome) -> Outcome {
+    let failed: Vec<_> = first
+        .changes
+        .iter()
+        .filter_map(|c| c.result.as_ref().err().cloned())
+        .collect();
+    first.warnings.retain(|w| !failed.contains(w));
+    first.warnings.extend(retry.warnings);
+    first.superseded |= retry.superseded;
+    first.presentation_ms = first.presentation_ms.or_else(|| {
+        retry
+            .presentation_ms
+            .map(|ms| f64::from(first.total_ms) + ms)
+    });
+    for mut result in retry.changes {
+        if let Some(previous) = first
+            .changes
+            .iter_mut()
+            .find(|r| r.id == result.id && r.kind == result.kind)
+        {
+            result.elapsed_ms += previous.elapsed_ms;
+            result.pre_read_ms += previous.pre_read_ms;
+            result.write_ms += previous.write_ms;
+            result.verify_ms += previous.verify_ms;
+            result.verify_reads += previous.verify_reads;
+            result.wait_ms += previous.wait_ms;
+            result.attempts += previous.attempts;
+            result.started_ms = previous.started_ms;
+            *previous = result;
+        } else {
+            result.started_ms += f64::from(first.elapsed_ms);
+            first.changes.push(result);
+        }
+    }
+    first.channels = first
+        .changes
+        .iter()
+        .filter(|r| matches!(r.result, Ok(true)))
+        .count();
+    first.elapsed_ms = first.elapsed_ms.saturating_add(retry.elapsed_ms);
+    first.write_ms = first.write_ms.max(
+        first
+            .elapsed_ms
+            .saturating_sub(retry.elapsed_ms)
+            .saturating_add(retry.write_ms),
+    );
+    first.prepare_ms = first.prepare_ms.saturating_add(retry.prepare_ms);
+    first.total_ms = first.total_ms.saturating_add(retry.total_ms);
+    first
 }
 fn milliseconds(duration: Duration) -> u32 {
     duration.as_millis().min(u32::MAX as u128) as u32

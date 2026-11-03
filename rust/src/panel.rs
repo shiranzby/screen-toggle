@@ -54,6 +54,11 @@ pub const MAXIMIZE: i32 = 2098;
 pub const THEME_LIGHT: i32 = 2111;
 pub const THEME_DARK: i32 = 2112;
 pub const THEME_SYSTEM: i32 = 2113;
+pub const DESKTOP_ENABLED: i32 = 2131;
+pub const DESKTOP_HOTKEY: i32 = 2132;
+pub const DESKTOP_DOUBLE: i32 = 2133;
+pub const HOTKEY_DOUBLE: i32 = 2136;
+pub const SCREENS: i32 = 2141;
 
 const BODY_H: i32 = 116;
 const FOOTER_H: i32 = 40;
@@ -70,8 +75,10 @@ struct Row {
 #[derive(Clone)]
 enum RowKind {
     Toggle(i32),
+    TogglePair([(i32, &'static str, &'static str); 2]),
     Choice(Vec<(i32, &'static str, i32)>),
-    Hotkey,
+    Hotkey(i32),
+    Action(i32),
     Delay,
     Time(i32),
 }
@@ -275,7 +282,7 @@ struct Panel {
     colors: Cell<theme::Palette>,
     theme: Cell<Theme>,
     system_dark: Cell<bool>,
-    capturing: Cell<bool>,
+    capturing: Cell<i32>,
     test_mode: bool,
     buffered: bool,
     last_values: RefCell<Vec<(i32, String)>>,
@@ -421,15 +428,39 @@ impl Panel {
     fn rows() -> Vec<Row> {
         vec![
             Row {
-                title: "全局热键",
-                desc: "点击后按下组合键；Esc 取消",
+                title: "全局触发热键",
+                desc: "点击后按键盘或鼠标按键；Esc 取消",
                 group: 0,
-                kind: RowKind::Hotkey,
+                kind: RowKind::Hotkey(HOTKEY),
+            },
+            Row {
+                title: "双击触发",
+                desc: "开启后连续按两次；关闭时按一次",
+                group: 0,
+                kind: RowKind::Toggle(HOTKEY_DOUBLE),
+            },
+            Row {
+                title: "启用桌面触发",
+                desc: "不响应图标与窗口；酷呆接管时暂停",
+                group: 1,
+                kind: RowKind::Toggle(DESKTOP_ENABLED),
+            },
+            Row {
+                title: "桌面触发热键",
+                desc: "仅桌面空白处；支持键盘与鼠标",
+                group: 1,
+                kind: RowKind::Hotkey(DESKTOP_HOTKEY),
+            },
+            Row {
+                title: "双击触发",
+                desc: "独立设置；侧键可避开左键双击冲突",
+                group: 1,
+                kind: RowKind::Toggle(DESKTOP_DOUBLE),
             },
             Row {
                 title: "面板主题",
                 desc: "深色减少亮光；可跟随系统",
-                group: 0,
+                group: 2,
                 kind: RowKind::Choice(vec![
                     (THEME_LIGHT, "浅色", 88),
                     (THEME_DARK, "深色", 88),
@@ -439,7 +470,7 @@ impl Panel {
             Row {
                 title: "熄屏时光标",
                 desc: "亮屏时始终恢复指针",
-                group: 1,
+                group: 3,
                 kind: RowKind::Choice(vec![
                     (CUR_AUTO, "远控保留，其余隐藏", 176),
                     (CUR_HIDE, "始终隐藏", 104),
@@ -447,27 +478,30 @@ impl Panel {
                 ]),
             },
             Row {
-                title: "压暗外接屏",
-                desc: "通过 DDC/CI 调节背光",
-                group: 1,
-                kind: RowKind::Toggle(EXT),
+                title: "切换屏幕",
+                desc: "仅切换所选屏幕，选择自动保存",
+                group: 3,
+                kind: RowKind::Action(SCREENS),
             },
             Row {
-                title: "压暗内置屏",
-                desc: "通过 WMI 调节背光",
-                group: 1,
-                kind: RowKind::Toggle(INT),
+                title: "",
+                desc: "",
+                group: 3,
+                kind: RowKind::TogglePair([
+                    (EXT, "压暗外接屏", "通过 DDC/CI 调节背光"),
+                    (INT, "压暗内置屏", "通过 WMI 调节背光"),
+                ]),
             },
             Row {
                 title: "关闭 HDR",
                 desc: "恢复时还原熄屏前的 HDR 状态",
-                group: 1,
+                group: 3,
                 kind: RowKind::Toggle(HDR),
             },
             Row {
                 title: "熄屏顺序",
                 desc: "黑窗与背光的执行顺序",
-                group: 2,
+                group: 4,
                 kind: RowKind::Choice(vec![
                     (BLACK, "先黑后熄", 126),
                     (DIM, "先熄后黑", 126),
@@ -477,7 +511,7 @@ impl Panel {
             Row {
                 title: "亮屏方式",
                 desc: "写入成功先亮屏，后台回读确认",
-                group: 2,
+                group: 4,
                 kind: RowKind::Choice(vec![
                     (READY, "写入完成即撤窗", 190),
                     (DELAY_MODE, "固定延迟", 126),
@@ -486,37 +520,37 @@ impl Panel {
             Row {
                 title: "调光耗时",
                 desc: "固定延迟时，恢复后额外保留黑窗；ms",
-                group: 2,
+                group: 4,
                 kind: RowKind::Delay,
             },
             Row {
                 title: "定时熄屏",
                 desc: "每天到点自动熄屏 / 亮屏",
-                group: 3,
+                group: 5,
                 kind: RowKind::Toggle(SCHEDULE),
             },
             Row {
                 title: "熄屏时间",
                 desc: "24 小时制，例如 23:00",
-                group: 3,
+                group: 5,
                 kind: RowKind::Time(DARK_TIME),
             },
             Row {
                 title: "亮屏时间",
                 desc: "手动操作后 10 分钟内定时让步",
-                group: 3,
+                group: 5,
                 kind: RowKind::Time(LIGHT_TIME),
             },
             Row {
                 title: "开机静默启动",
                 desc: "登录后驻留托盘；双击打开设置",
-                group: 4,
+                group: 6,
                 kind: RowKind::Toggle(AUTOSTART),
             },
             Row {
                 title: "关闭窗口时",
                 desc: "隐藏到托盘或恢复屏幕后退出",
-                group: 4,
+                group: 6,
                 kind: RowKind::Choice(vec![
                     (CLOSE_HIDE, "隐藏到托盘", 158),
                     (CLOSE_EXIT, "退出程序", 126),
@@ -547,14 +581,19 @@ impl Panel {
         let _ = ShowWindow(self.control(RETRY), SW_HIDE);
         for row in Self::rows() {
             match row.kind {
-                RowKind::Hotkey => {
-                    self.make(
-                        self.body.get(),
-                        HOTKEY,
-                        w!("BUTTON"),
-                        "",
-                        BS_PUSHBUTTON as u32,
-                    )?;
+                RowKind::Hotkey(id) | RowKind::Action(id) => {
+                    self.make(self.body.get(), id, w!("BUTTON"), "", BS_PUSHBUTTON as u32)?;
+                }
+                RowKind::TogglePair(items) => {
+                    for (id, title, _) in items {
+                        self.make(
+                            self.body.get(),
+                            id,
+                            w!("BUTTON"),
+                            title,
+                            BS_AUTOCHECKBOX as u32,
+                        )?;
+                    }
                 }
                 RowKind::Toggle(id) => {
                     let h = self.make(
@@ -669,18 +708,29 @@ impl Panel {
         // would publish the old frame before any child has reached its new spot.
         let dc = CreateCompatibleDC(None);
         let old_font = SelectObject(dc, self.fonts.borrow()[0]);
-        let key_text: Vec<u16> = text(self.control(HOTKEY)).encode_utf16().collect();
-        let mut key_size = SIZE::default();
-        let _ = GetTextExtentPoint32W(dc, &key_text, &mut key_size);
+        let key_widths = [HOTKEY, DESKTOP_HOTKEY].map(|id| {
+            let key_text: Vec<u16> = text(self.control(id)).encode_utf16().collect();
+            let mut key_size = SIZE::default();
+            let _ = GetTextExtentPoint32W(dc, &key_text, &mut key_size);
+            (id, key_size.cx.saturating_add(s(32)).max(s(204)))
+        });
         SelectObject(dc, old_font);
         let _ = DeleteDC(dc);
-        let key_width = key_size.cx.saturating_add(s(32)).max(s(204));
+        let key_width = |id| key_widths.iter().find(|(key, _)| *key == id).unwrap().1;
         let mut y = 4;
         let mut placements = Vec::new();
         let mut groups = Vec::new();
-        for (index, title) in ["快捷键与外观", "屏幕", "时序", "定时", "启动与关闭"]
-            .into_iter()
-            .enumerate()
+        for (index, title) in [
+            "全局触发",
+            "桌面触发",
+            "外观",
+            "屏幕",
+            "时序",
+            "定时",
+            "启动与关闭",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let header = y;
             y += 28;
@@ -689,7 +739,7 @@ impl Panel {
                 let stacked = match &row.kind {
                     RowKind::Choice(items) => items.iter().map(|i| i.2).sum::<i32>() > width - 316,
                     RowKind::Delay => width < 700,
-                    RowKind::Hotkey => key_width > s(width - 340),
+                    RowKind::Hotkey(id) => key_width(*id) > s(width - 340),
                     _ => false,
                 };
                 let height = if stacked {
@@ -733,14 +783,27 @@ impl Panel {
             };
             match &placement.row.kind {
                 RowKind::Toggle(id) => mv(*id, right - s(64), cy - s(22), s(64), s(44)),
-                RowKind::Hotkey => {
+                RowKind::TogglePair(items) => {
+                    let start = s(44);
+                    let half = (right - start) / 2;
+                    for (index, (id, _, _)) in items.iter().enumerate() {
+                        let edge = if index == 0 {
+                            start + half - s(16)
+                        } else {
+                            right
+                        };
+                        mv(*id, edge - s(64), cy - s(22), s(64), s(44));
+                    }
+                }
+                RowKind::Action(id) => mv(*id, right - s(176), cy - s(18), s(176), s(36)),
+                RowKind::Hotkey(id) => {
                     let cy = if placement.height > 48 {
                         row_y + s(68)
                     } else {
                         cy
                     };
-                    let key_width = key_width.min(body_rect.right - s(88));
-                    mv(HOTKEY, right - key_width, cy - s(18), key_width, s(36));
+                    let key_width = key_width(*id).min(body_rect.right - s(88));
+                    mv(*id, right - key_width, cy - s(18), key_width, s(36));
                 }
                 RowKind::Time(id) => mv(*id, right - s(126), cy - s(17), s(126), s(34)),
                 RowKind::Choice(items) => {
@@ -936,22 +999,48 @@ impl Panel {
             if top + s(p.height) < 0 || top > cr.bottom {
                 continue;
             }
-            label(
-                dc,
-                rect(left + s(16), label_top, s(210), s(20)),
-                p.row.title,
-                fonts[0],
-                self.colors.get().ink,
-                DT_LEFT | DT_SINGLELINE,
-            );
-            label(
-                dc,
-                rect(left + s(16), label_top + s(21), s(228), s(19)),
-                p.row.desc,
-                fonts[1],
-                self.colors.get().secondary,
-                DT_LEFT | DT_SINGLELINE,
-            );
+            if let RowKind::TogglePair(items) = &p.row.kind {
+                let start = left + s(16);
+                let end = right - s(16);
+                let half = (end - start) / 2;
+                for (index, (_, title, desc)) in items.iter().enumerate() {
+                    let x = start + half * index as i32;
+                    let width = half - s(if index == 0 { 96 } else { 80 });
+                    label(
+                        dc,
+                        rect(x, label_top, width, s(20)),
+                        title,
+                        fonts[0],
+                        self.colors.get().ink,
+                        DT_LEFT | DT_SINGLELINE,
+                    );
+                    label(
+                        dc,
+                        rect(x, label_top + s(21), width, s(19)),
+                        desc,
+                        fonts[1],
+                        self.colors.get().secondary,
+                        DT_LEFT | DT_SINGLELINE,
+                    );
+                }
+            } else {
+                label(
+                    dc,
+                    rect(left + s(16), label_top, s(210), s(20)),
+                    p.row.title,
+                    fonts[0],
+                    self.colors.get().ink,
+                    DT_LEFT | DT_SINGLELINE,
+                );
+                label(
+                    dc,
+                    rect(left + s(16), label_top + s(21), s(228), s(19)),
+                    p.row.desc,
+                    fonts[1],
+                    self.colors.get().secondary,
+                    DT_LEFT | DT_SINGLELINE,
+                );
+            }
             if p.row.title != "全局热键"
                 && p.row.title != "熄屏时光标"
                 && p.row.title != "熄屏顺序"
@@ -1182,7 +1271,7 @@ pub unsafe fn create(
         colors: Cell::new(colors),
         theme: Cell::new(config.theme),
         system_dark: Cell::new(system_dark),
-        capturing: Cell::new(false),
+        capturing: Cell::new(0),
         test_mode,
         buffered: BufferedPaintInit().is_ok(),
     });
@@ -1295,12 +1384,15 @@ pub unsafe fn status(hwnd: HWND, message: &str) {
         }
     }
 }
-pub unsafe fn set_capture(hwnd: HWND, capturing: bool, label: &str) {
+pub unsafe fn set_capture(hwnd: HWND, target_id: i32, capturing: bool, label: &str) {
+    if !is_hotkey_id(target_id) {
+        return;
+    }
     if let Some(p) = data(hwnd) {
-        p.capturing.set(capturing);
-        set_text(p.control(HOTKEY), label);
+        p.capturing.set(if capturing { target_id } else { 0 });
+        set_text(p.control(target_id), label);
         if capturing {
-            let _ = SetFocus(p.control(HOTKEY));
+            let _ = SetFocus(p.control(target_id));
         }
         p.layout();
     }
@@ -1326,6 +1418,9 @@ pub unsafe fn sync(hwnd: HWND, cfg: &Config, force: bool) {
         (HDR, cfg.hdr_off),
         (AUTOSTART, cfg.autostart),
         (SCHEDULE, cfg.schedule_enabled),
+        (HOTKEY_DOUBLE, cfg.hotkey_double_click),
+        (DESKTOP_ENABLED, cfg.desktop_trigger_enabled),
+        (DESKTOP_DOUBLE, cfg.desktop_double_click),
         (BLACK, cfg.dim_order == DimOrder::BlackFirst),
         (DIM, cfg.dim_order == DimOrder::DimFirst),
         (FADE, cfg.dim_order == DimOrder::Fade),
@@ -1350,6 +1445,14 @@ pub unsafe fn sync(hwnd: HWND, cfg: &Config, force: bool) {
     }
     let values = vec![
         (HOTKEY, cfg.hotkey.label()),
+        (DESKTOP_HOTKEY, cfg.desktop_hotkey.label()),
+        (
+            SCREENS,
+            cfg.selected_displays.as_ref().map_or_else(
+                || "所有屏幕".into(),
+                |ids| format!("已选 {} 块屏幕", ids.len()),
+            ),
+        ),
         (DELAY, cfg.delay_ms.to_string()),
         (DARK_TIME, cfg.dark_at.label()),
         (LIGHT_TIME, cfg.light_at.label()),
@@ -1361,8 +1464,8 @@ pub unsafe fn sync(hwnd: HWND, cfg: &Config, force: bool) {
             .iter()
             .find(|(key, _)| key == id)
             .map(|(_, text)| text.clone());
-        if (*id != HOTKEY || !p.capturing.get())
-            && (force || *id == HOTKEY || previous.as_ref() == Some(&text(p.control(*id))))
+        if p.capturing.get() != *id
+            && (force || is_hotkey_id(*id) || previous.as_ref() == Some(&text(p.control(*id))))
         {
             set_text(p.control(*id), value);
         }
@@ -1381,6 +1484,9 @@ pub unsafe fn is_edit(hwnd: HWND, target: HWND) -> bool {
     [DELAY, DARK_TIME, LIGHT_TIME]
         .into_iter()
         .any(|id| control(hwnd, id) == target)
+}
+pub fn is_hotkey_id(id: i32) -> bool {
+    matches!(id, HOTKEY | DESKTOP_HOTKEY)
 }
 pub unsafe fn set_dark(hwnd: HWND, dark: bool) {
     set_text(
@@ -1402,7 +1508,10 @@ pub unsafe fn ensure_focus(hwnd: HWND) {
         return;
     };
     let focus = GetFocus();
-    if focus == p.control(HOTKEY) {
+    if [HOTKEY, DESKTOP_HOTKEY]
+        .into_iter()
+        .any(|id| focus == p.control(id))
+    {
         p.scroll_by(0);
         return;
     }
@@ -1844,6 +1953,13 @@ unsafe fn stroke(dc: HDC, from: (i32, i32), to: (i32, i32)) {
     let _ = LineTo(dc, to.0, to.1);
 }
 unsafe fn group_icon(dc: HDC, index: usize, x: i32, y: i32, size: i32, secondary: COLORREF) {
+    let index = match index {
+        0 | 1 => 0,
+        2 | 3 => 1,
+        4 => 2,
+        5 => 3,
+        _ => 4,
+    };
     let s = |v| v * size / 18;
     let pen = CreatePen(PS_SOLID, 1, secondary);
     let oldp = SelectObject(dc, pen);
@@ -1944,7 +2060,10 @@ unsafe fn draw_slider(p: &Panel, h: HWND, dc: HDC) {
 }
 unsafe fn draw_button(p: &Panel, h: HWND, dc: HDC) {
     let control_id = GetDlgCtrlID(h);
-    if matches!(control_id, EXT | INT | HDR | SCHEDULE | AUTOSTART) {
+    if matches!(
+        control_id,
+        EXT | INT | HDR | SCHEDULE | AUTOSTART | HOTKEY_DOUBLE | DESKTOP_ENABLED | DESKTOP_DOUBLE
+    ) {
         draw_toggle(p, h, dc);
         return;
     }
@@ -2046,7 +2165,7 @@ unsafe fn draw_button(p: &Panel, h: HWND, dc: HDC) {
         } else {
             p.colors.get().surface
         };
-        let capture = control_id == HOTKEY && p.capturing.get();
+        let capture = is_hotkey_id(control_id) && p.capturing.get() == control_id;
         // A continuous outer accent ring indicates recording, not ordinary
         // keyboard focus. Keep normal buttons/edits free of focus adornments.
         if capture {
@@ -2158,8 +2277,13 @@ unsafe extern "system" fn widget_proc(
         p.invalidate_window(h);
         return result;
     }
-    if control_id == HOTKEY && m == WM_KILLFOCUS && p.capturing.get() {
-        let _ = PostMessageW(p.owner, app::WM_CANCEL_CAPTURE, WPARAM(0), LPARAM(0));
+    if is_hotkey_id(control_id) && m == WM_KILLFOCUS && p.capturing.get() == control_id {
+        let _ = PostMessageW(
+            p.owner,
+            app::WM_CANCEL_CAPTURE,
+            WPARAM(control_id as usize),
+            LPARAM(0),
+        );
     }
     if m == WM_MOUSEWHEEL {
         // Settings pages scroll under the pointer; a focused native trackbar

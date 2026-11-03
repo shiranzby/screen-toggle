@@ -18,3 +18,5 @@ checks/evidence/**
 !checks/evidence/startup-v0.3-final/*.json
 !checks/evidence/resources-v0.3-final/
 !checks/evidence/resources-v0.3-final/*.json
+!checks/evidence/v0.4.0/
+!checks/evidence/v0.4.0/summary.json

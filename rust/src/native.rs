@@ -1,4 +1,5 @@
 //! Windows resources stay on their owning worker thread. No raw handle enters a journal.
+use crate::config::{display_is_selected, display_wmi_instance};
 use crate::engine::{
     confirm_change_after_snapshot, confirm_change_after_snapshot_with_ack, Backend, Change,
     ChangeResult, Device, Inventory, Kind, ScanRequest, WriteAcknowledgements,
@@ -121,7 +122,11 @@ impl Wmi {
                 .ExecQuery(
                     &BSTR::from("WQL"),
                     &BSTR::from(query),
-                    wmi::WBEM_FLAG_FORWARD_ONLY | wmi::WBEM_FLAG_RETURN_IMMEDIATELY,
+                    // Projection queries still need a usable instance path for
+                    // the later fresh GetObject confirmation read.
+                    wmi::WBEM_FLAG_FORWARD_ONLY
+                        | wmi::WBEM_FLAG_RETURN_IMMEDIATELY
+                        | wmi::WBEM_FLAG_ENSURE_LOCATABLE,
                     None,
                 )
                 .map_err(|e| e.to_string())?;
@@ -149,7 +154,7 @@ impl Wmi {
             let mut v = VARIANT::default();
             object
                 .Get(PCWSTR(wide(name).as_ptr()), 0, &mut v, None, None)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("WMI 属性 {name}：{e}"))?;
             Ok(v)
         }
     }
@@ -158,6 +163,13 @@ impl Wmi {
         BSTR::try_from(&Self::property(object, name)?)
             .map(|s| s.to_string())
             .map_err(|e| e.to_string())
+    }
+    fn instance_path(object: &wmi::IWbemClassObject) -> Result<String, String> {
+        let path = Self::text(object, "__PATH")?;
+        if path.trim().is_empty() {
+            return Err("WMI 实例路径为空".into());
+        }
+        Ok(path)
     }
     fn get_object(&self, path: &str) -> Result<wmi::IWbemClassObject, String> {
         unsafe {
@@ -170,7 +182,7 @@ impl Wmi {
                     Some(&mut object),
                     None,
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("WMI GetObject：{e}"))?;
             object.ok_or_else(|| "WMI 实例已不可用".into())
         }
     }
@@ -197,20 +209,18 @@ impl Wmi {
         let result = (|| {
             // Recovery needs fresh active identities and method paths, not a
             // second sample of the brightness that is about to be overwritten.
-            let query = if read_brightness {
-                "SELECT * FROM WmiMonitorBrightness WHERE Active = TRUE"
-            } else {
-                "SELECT InstanceName FROM WmiMonitorBrightness WHERE Active = TRUE"
+            let Some(query) = access.wmi_query(read_brightness) else {
+                return Ok(Vec::new());
             };
             let mut objects = Vec::new();
-            for object in self.query(query)? {
+            for object in self.query(&query)? {
                 let instance = Self::text(&object, "InstanceName")?;
                 if !access.allows(&format!("wmi:{instance}"), Kind::Internal) {
                     continue;
                 }
                 let key = normalized(&instance);
                 let paths = WmiPaths {
-                    brightness: Self::text(&object, "__PATH")?,
+                    brightness: Self::instance_path(&object)?,
                     methods: String::new(),
                 };
                 if self.paths.insert(key, paths).is_some() {
@@ -228,7 +238,7 @@ impl Wmi {
                             if !paths.methods.is_empty() {
                                 return Err("内置屏方法实例身份不唯一".into());
                             }
-                            paths.methods = Self::text(&object, "__PATH")?;
+                            paths.methods = Self::instance_path(&object)?;
                         }
                     }
                     if self.paths.values().any(|p| p.methods.is_empty()) {
@@ -350,22 +360,47 @@ impl Wmi {
                     None,
                 )
                 .map_err(|e| format!("WmiSetBrightness 调用：{e}"))?;
-            // Some providers return S_OK without an output object. The Engine
-            // independently verifies the resulting brightness in either case.
-            if let Some(output) = returned {
-                let code = u32::try_from(&Self::property(&output, "ReturnValue")?)
-                    .map_err(|e| e.to_string())?;
-                if code != 0 {
-                    return Err(format!("WmiSetBrightness 返回错误 {code}"));
-                }
-            }
-            Ok(())
+            // Some providers expose no output parameters, even when ExecMethod
+            // returns an object. A missing ReturnValue is not a failed write;
+            // the Engine still requires its independent exact brightness read.
+            let status = returned
+                .as_ref()
+                .map(|output| {
+                    let mut value = VARIANT::default();
+                    output
+                        .Get(w!("ReturnValue"), 0, &mut value, None, None)
+                        .map(|_| value)
+                })
+                .transpose();
+            validate_wmi_method_return(status)
         })();
         if result.is_err() {
             self.invalidate();
         }
         result
     }
+}
+
+fn validate_wmi_method_return(
+    status: windows::core::Result<Option<VARIANT>>,
+) -> Result<(), String> {
+    let value = match status {
+        Ok(None) => return Ok(()),
+        // WBEM_E_NOT_FOUND is accepted only for this optional output property,
+        // never for ExecMethod, device discovery, or the confirmation read.
+        Err(error) if error.code().0 as u32 == 0x8004_1002 => return Ok(()),
+        Err(error) => return Err(format!("WmiSetBrightness 状态读取：{error}")),
+        Ok(Some(value)) => value,
+    };
+    if unsafe { value.as_raw().Anonymous.Anonymous.vt } <= 1 {
+        return Err("WmiSetBrightness 状态字段为空".into());
+    }
+    let code =
+        u32::try_from(&value).map_err(|error| format!("WmiSetBrightness 状态字段无效：{error}"))?;
+    if code != 0 {
+        return Err(format!("WmiSetBrightness 返回错误 {code}"));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -376,6 +411,64 @@ struct Target {
     adapter: LUID,
     target: u32,
     internal: bool,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DisplayInfo {
+    pub id: String,
+    pub name: String,
+    pub source: String,
+    pub internal: bool,
+    pub rect: [i32; 4],
+}
+
+/// Read-only logical topology for the settings page and overlay regions. This
+/// never enumerates physical monitor handles or reads DDC/WMI brightness.
+pub fn displays() -> Result<Vec<DisplayInfo>, String> {
+    let topology = targets()?;
+    validate_target_identities(&topology)?;
+    let mut logical = Vec::<HMONITOR>::new();
+    unsafe {
+        gdi::EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM((&mut logical as *mut Vec<HMONITOR>) as isize),
+        )
+        .ok()
+        .map_err(|e| e.to_string())?;
+    }
+    let mut rectangles = BTreeMap::new();
+    for monitor in logical {
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if !unsafe { gdi::GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+            return Err(os_error("逻辑屏位置读取失败"));
+        }
+        let area = info.monitorInfo.rcMonitor;
+        rectangles.insert(
+            normalized(&from_wide(&info.szDevice)),
+            [area.left, area.top, area.right, area.bottom],
+        );
+    }
+    topology
+        .into_iter()
+        .map(|target| {
+            let rect = rectangles
+                .get(&normalized(&target.source))
+                .copied()
+                .ok_or_else(|| format!("{}：缺少当前桌面位置", target.source))?;
+            if rect[0] >= rect[2] || rect[1] >= rect[3] {
+                return Err("显示器桌面范围无效".into());
+            }
+            Ok(DisplayInfo {
+                id: target.id,
+                name: target.name,
+                source: target.source,
+                internal: target.internal,
+                rect,
+            })
+        })
+        .collect()
 }
 fn header(
     kind: display::DISPLAYCONFIG_DEVICE_INFO_TYPE,
@@ -518,7 +611,7 @@ fn id_prefix(kind: Kind) -> &'static str {
     }
 }
 #[derive(Clone, Default)]
-struct DeviceAccess(Option<BTreeSet<String>>);
+struct DeviceAccess(Option<BTreeSet<String>>, Option<Vec<String>>);
 impl DeviceAccess {
     fn restricted(ids: Vec<String>) -> Result<Self, String> {
         if ids.is_empty()
@@ -533,7 +626,10 @@ impl DeviceAccess {
         {
             return Err("限定设备需要非空的完整 ddc:/wmi:/hdr: 身份列表".into());
         }
-        Ok(Self(Some(ids.iter().map(|id| normalized(id)).collect())))
+        Ok(Self(
+            Some(ids.iter().map(|id| normalized(id)).collect()),
+            None,
+        ))
     }
     fn allows(&self, id: &str, kind: Kind) -> bool {
         id.starts_with(id_prefix(kind))
@@ -542,20 +638,64 @@ impl DeviceAccess {
                 .0
                 .as_ref()
                 .is_none_or(|ids| ids.contains(&normalized(id)))
+            && display_is_selected(id, self.1.as_deref())
     }
     fn includes(&self, kind: Kind) -> bool {
-        self.0
-            .as_ref()
-            .is_none_or(|ids| ids.iter().any(|id| id.starts_with(id_prefix(kind))))
+        self.1.as_ref().is_none_or(|ids| !ids.is_empty())
+            && self
+                .0
+                .as_ref()
+                .is_none_or(|ids| ids.iter().any(|id| id.starts_with(id_prefix(kind))))
+    }
+    fn selected(&self, selected: Option<&[String]>) -> Self {
+        Self(self.0.clone(), selected.map(<[String]>::to_vec))
+    }
+    fn wmi_query(&self, brightness: bool) -> Option<String> {
+        let instances: Option<BTreeSet<String>> = match (&self.0, &self.1) {
+            (None, None) => None,
+            (Some(ids), _) => Some(
+                ids.iter()
+                    .filter(|id| self.allows(id, Kind::Internal))
+                    .filter_map(|id| id.strip_prefix("wmi:").map(str::to_owned))
+                    .collect(),
+            ),
+            (None, Some(displays)) => Some(
+                displays
+                    .iter()
+                    .filter_map(|id| display_wmi_instance(id))
+                    .collect(),
+            ),
+        };
+        let fields = if brightness { "*" } else { "InstanceName" };
+        let mut query = format!("SELECT {fields} FROM WmiMonitorBrightness WHERE Active = TRUE");
+        if let Some(instances) = instances {
+            if instances.is_empty() {
+                return None;
+            }
+            let clauses: Vec<_> = instances
+                .into_iter()
+                .map(|instance| {
+                    let escaped = instance.replace('\\', "\\\\").replace('\'', "\\'");
+                    format!("InstanceName = '{escaped}'")
+                })
+                .collect();
+            query.push_str(" AND (");
+            query.push_str(&clauses.join(" OR "));
+            query.push(')');
+        }
+        Some(query)
     }
     fn intersect(&self, entries: &[Device]) -> Self {
-        Self(Some(
-            entries
-                .iter()
-                .filter(|d| self.allows(&d.id, d.kind))
-                .map(|d| normalized(&d.id))
-                .collect(),
-        ))
+        Self(
+            Some(
+                entries
+                    .iter()
+                    .filter(|d| self.allows(&d.id, d.kind))
+                    .map(|d| normalized(&d.id))
+                    .collect(),
+            ),
+            None,
+        )
     }
 }
 type TopologyKey = Vec<(String, String, u32, i32, u32, bool)>;
@@ -608,6 +748,31 @@ fn validate_recovery_entries(access: &DeviceAccess, entries: &[Device]) -> Resul
         }
     }
     Ok(())
+}
+fn validate_target_identities(topology: &[Target]) -> Result<(), String> {
+    let mut identities = BTreeSet::new();
+    if topology
+        .iter()
+        .any(|target| !identities.insert(normalized(&target.id)))
+    {
+        return Err("显示拓扑存在重复设备身份，已拒绝绑定物理屏".into());
+    }
+    Ok(())
+}
+type BoundExternal<P> = (BTreeMap<String, P>, BTreeMap<String, (u32, u32)>);
+fn bind_external_baselines<P>(
+    entries: &[Device],
+    mut candidates: BTreeMap<String, P>,
+) -> BoundExternal<P> {
+    let mut physical = BTreeMap::new();
+    let mut ranges = BTreeMap::new();
+    for device in entries.iter().filter(|d| d.kind == Kind::External) {
+        if let Some(resource) = candidates.remove(&normalized(&device.id)) {
+            ranges.insert(device.id.clone(), (device.min, device.max));
+            physical.insert(device.id.clone(), resource);
+        }
+    }
+    (physical, ranges)
 }
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct NativeStats {
@@ -691,6 +856,91 @@ impl Native {
             self.wmi = None;
         }
         result
+    }
+    fn rebind_internal(&mut self, access: &DeviceAccess, requested: bool) -> Result<(), String> {
+        if !requested {
+            return Ok(());
+        }
+        if self.wmi.is_none() {
+            self.wmi = Some(Wmi::connect()?);
+        }
+        let result = self
+            .wmi
+            .as_mut()
+            .ok_or("WMI 不可用")?
+            .discover_paths(access, false)
+            .map(|_| ());
+        if result.is_err() {
+            self.wmi = None;
+        }
+        result
+    }
+    fn rebind_resources(&mut self, entries: &[Device]) -> Result<Vec<String>, String> {
+        validate_recovery_entries(&self.access, entries)?;
+        self.snapshot = None;
+        self.physical.clear();
+        self.ranges.clear();
+        self.targets.clear();
+        if let Some(wmi) = &mut self.wmi {
+            wmi.paths.clear();
+        }
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.stats.restore_rebinds = self.stats.restore_rebinds.saturating_add(1);
+        if self.test_mode {
+            return Ok(vec!["测试模式：未重新绑定真实硬件".into()]);
+        }
+        let access = self.access.intersect(entries);
+        let request = ScanRequest::from_devices(entries);
+        let mut warnings = Vec::new();
+        let topology = if request.external || request.hdr {
+            match targets() {
+                Ok(topology) => {
+                    validate_target_identities(&topology)?;
+                    topology
+                }
+                Err(error) => {
+                    warnings.push(error);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let jobs = if request.external {
+            vec![()]
+        } else {
+            Vec::new()
+        };
+        let (external, internal) = parallel_with_local(
+            jobs,
+            |_| discover_physical(&topology, &access),
+            || self.rebind_internal(&access, request.internal),
+        );
+        if let Some(result) = external.into_iter().next() {
+            let (candidates, notes) = result.map_err(|_| "外屏绑定线程异常结束")??;
+            warnings.extend(notes);
+            let candidates = candidates
+                .into_iter()
+                .map(|(id, (_, physical))| (id, physical))
+                .collect();
+            (self.physical, self.ranges) = bind_external_baselines(entries, candidates);
+        }
+        if let Err(error) = internal {
+            warnings.push(format!("内置屏绑定不可用：{error}"));
+        }
+        for entry in entries.iter().filter(|d| d.kind == Kind::Hdr) {
+            if let Some(target) = topology
+                .iter()
+                .find(|t| normalized(&format!("hdr:{}", t.id)) == normalized(&entry.id))
+            {
+                self.targets.insert(entry.id.clone(), target.clone());
+            }
+        }
+        // Only metadata/resources were refreshed. Device.value and the journal
+        // remain the pre-dark baseline; no dimmed brightness is sampled here.
+        Ok(warnings)
     }
     fn scan_with_access(
         &mut self,
@@ -886,6 +1136,7 @@ fn discover_external(
     request: ScanRequest,
     access: &DeviceAccess,
 ) -> Result<ExternalScan, String> {
+    validate_target_identities(topology)?;
     let mut out = ExternalScan::default();
     if request.hdr {
         for target in topology {
@@ -916,70 +1167,8 @@ fn discover_external(
     if !request.external {
         return Ok(out);
     }
-    let mut logical = Vec::<HMONITOR>::new();
-    unsafe {
-        gdi::EnumDisplayMonitors(
-            None,
-            None,
-            Some(collect_monitor),
-            LPARAM((&mut logical as *mut Vec<HMONITOR>) as isize),
-        )
-        .ok()
-        .map_err(|e| e.to_string())?;
-    }
-    let mut candidates = BTreeMap::new();
-    for monitor in logical {
-        unsafe {
-            let mut info = MONITORINFOEXW::default();
-            info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
-            if !gdi::GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
-                out.inventory.warnings.push(os_error("逻辑屏读取失败"));
-                continue;
-            }
-            let source = from_wide(&info.szDevice);
-            let matching: Vec<_> = topology.iter().filter(|t| t.source == source).collect();
-            if matching.len() != 1 {
-                out.inventory
-                    .warnings
-                    .push(format!("{source}：无法唯一识别物理屏，跳过 DDC"));
-                continue;
-            }
-            let target = matching[0];
-            let id = format!("ddc:{}", target.id);
-            // Exclude built-in and unauthorized screens before *any* physical
-            // monitor API. Filtering the returned inventory would be too late.
-            if target.internal || !access.allows(&id, Kind::External) {
-                continue;
-            }
-            let mut count = 0;
-            if display::GetNumberOfPhysicalMonitorsFromHMONITOR(monitor, &mut count).is_err()
-                || count == 0
-            {
-                continue;
-            }
-            if count > 64 {
-                out.inventory.warnings.push("物理屏数量异常，已跳过".into());
-                continue;
-            }
-            let mut monitors = vec![display::PHYSICAL_MONITOR::default(); count as usize];
-            if display::GetPhysicalMonitorsFromHMONITOR(monitor, &mut monitors).is_err() {
-                out.inventory.warnings.push(os_error("物理屏枚举失败"));
-                continue;
-            }
-            let owned: Vec<_> = monitors
-                .iter()
-                .map(|m| Physical(m.hPhysicalMonitor.0 as usize))
-                .collect();
-            if count != 1 {
-                out.inventory
-                    .warnings
-                    .push(format!("{source}：无法唯一识别物理屏，跳过 DDC"));
-                continue;
-            }
-            let physical = owned.into_iter().next().ok_or("缺少物理屏句柄")?;
-            candidates.insert(id, (target.name.clone(), physical));
-        }
-    }
+    let (candidates, warnings) = discover_physical(topology, access)?;
+    out.inventory.warnings.extend(warnings);
     // Owners remain in candidates until every read joins. Returning out then
     // transfers unique integer-backed ownership to the original worker.
     let jobs = candidates.values().map(|(_, p)| p.0).collect();
@@ -1004,12 +1193,93 @@ fn discover_external(
     }
     Ok(out)
 }
+type PhysicalCandidates = BTreeMap<String, (String, Physical)>;
+fn discover_physical(
+    topology: &[Target],
+    access: &DeviceAccess,
+) -> Result<(PhysicalCandidates, Vec<String>), String> {
+    validate_target_identities(topology)?;
+    let mut warnings = Vec::new();
+    let mut logical = Vec::<HMONITOR>::new();
+    unsafe {
+        gdi::EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM((&mut logical as *mut Vec<HMONITOR>) as isize),
+        )
+        .ok()
+        .map_err(|e| e.to_string())?;
+    }
+    let mut candidates = BTreeMap::new();
+    for monitor in logical {
+        unsafe {
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+            if !gdi::GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
+                warnings.push(os_error("逻辑屏读取失败"));
+                continue;
+            }
+            let source = from_wide(&info.szDevice);
+            let matching: Vec<_> = topology.iter().filter(|t| t.source == source).collect();
+            if matching.len() != 1 {
+                warnings.push(format!("{source}：无法唯一识别物理屏，跳过 DDC"));
+                continue;
+            }
+            let target = matching[0];
+            let id = format!("ddc:{}", target.id);
+            // Exclude built-in and unauthorized screens before *any* physical
+            // monitor API. Filtering the returned inventory would be too late.
+            if target.internal || !access.allows(&id, Kind::External) {
+                continue;
+            }
+            let mut count = 0;
+            if display::GetNumberOfPhysicalMonitorsFromHMONITOR(monitor, &mut count).is_err()
+                || count == 0
+            {
+                continue;
+            }
+            if count > 64 {
+                warnings.push("物理屏数量异常，已跳过".into());
+                continue;
+            }
+            let mut monitors = vec![display::PHYSICAL_MONITOR::default(); count as usize];
+            if display::GetPhysicalMonitorsFromHMONITOR(monitor, &mut monitors).is_err() {
+                warnings.push(os_error("物理屏枚举失败"));
+                continue;
+            }
+            let owned: Vec<_> = monitors
+                .iter()
+                .map(|m| Physical(m.hPhysicalMonitor.0 as usize))
+                .collect();
+            if count != 1 {
+                warnings.push(format!("{source}：无法唯一识别物理屏，跳过 DDC"));
+                continue;
+            }
+            let physical = owned.into_iter().next().ok_or("缺少物理屏句柄")?;
+            if candidates
+                .insert(id, (target.name.clone(), physical))
+                .is_some()
+            {
+                return Err("逻辑屏指向重复的物理设备身份，已拒绝绑定".into());
+            }
+        }
+    }
+    Ok((candidates, warnings))
+}
 impl Backend for Native {
     fn scan(&mut self) -> Result<Inventory, String> {
         self.scan_required(ScanRequest::all())
     }
     fn scan_required(&mut self, request: ScanRequest) -> Result<Inventory, String> {
         self.scan_with_access(request, self.access.clone())
+    }
+    fn scan_selected(
+        &mut self,
+        request: ScanRequest,
+        selected: Option<&[String]>,
+    ) -> Result<Inventory, String> {
+        self.scan_with_access(request, self.access.selected(selected))
     }
     fn prepare_restore(
         &mut self,
@@ -1031,11 +1301,10 @@ impl Backend for Native {
                 }
             }
         }
-        self.scan_with_access(
-            ScanRequest::from_devices(entries),
-            self.access.intersect(entries),
-        )
-        .map(|inventory| inventory.warnings)
+        self.rebind_resources(entries)
+    }
+    fn rebind_brightness(&mut self, entries: &[Device]) -> Result<Vec<String>, String> {
+        self.rebind_resources(entries)
     }
     fn apply_internal(
         &mut self,
@@ -1314,6 +1583,72 @@ pub fn remote_active() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "read-only query of this machine's WMI provider"]
+    fn native_wmi_restore_readonly_probe() -> Result<(), String> {
+        let mut service = Wmi::connect()?;
+        let mut expected = BTreeMap::new();
+        for query in [
+            "SELECT * FROM WmiMonitorBrightness WHERE Active = TRUE",
+            "SELECT InstanceName FROM WmiMonitorBrightness WHERE Active = TRUE",
+        ] {
+            let values = service.query(query)?;
+            eprintln!("QUERY={query} count={}", values.len());
+            assert!(
+                !values.is_empty(),
+                "This local probe needs an active WMI display"
+            );
+            for object in values {
+                let path = Wmi::text(&object, "__PATH")?;
+                eprintln!("PATH={path}");
+                assert!(
+                    !path.trim().is_empty(),
+                    "Projected WMI instance must be locatable"
+                );
+                let instance = normalized(&Wmi::text(&object, "InstanceName")?);
+                if query.starts_with("SELECT *") {
+                    expected.insert(instance, Wmi::brightness(&object)?);
+                } else {
+                    assert!(expected.contains_key(&instance));
+                }
+            }
+        }
+        let objects = service.discover_paths(&DeviceAccess::default(), false)?;
+        eprintln!(
+            "REBIND_OBJECTS={} PREPARATION_ERROR={:?} HAS_INPUT={}",
+            objects.len(),
+            service.preparation_error,
+            service.input.is_some()
+        );
+        assert_eq!(objects.len(), expected.len());
+        assert!(service.preparation_error.is_none());
+        assert!(service.input.is_some());
+        let instances: Vec<_> = service.paths.keys().cloned().collect();
+        for instance in instances {
+            let value = service.read(&instance)?;
+            eprintln!("FRESH_READ={value}");
+            assert_eq!(Some(&value), expected.get(&instance));
+        }
+        Ok(())
+    }
+    #[test]
+    fn wmi_optional_return_accepts_only_absence_or_explicit_zero() {
+        use windows::core::{Error, HRESULT};
+        assert!(validate_wmi_method_return(Ok(None)).is_ok());
+        assert!(validate_wmi_method_return(Err(Error::from_hresult(HRESULT(
+            0x8004_1002u32 as i32
+        ))))
+        .is_ok());
+        assert!(validate_wmi_method_return(Ok(Some(VARIANT::from(0i32)))).is_ok());
+        assert!(validate_wmi_method_return(Ok(Some(VARIANT::from(0u32)))).is_ok());
+        assert!(validate_wmi_method_return(Ok(Some(VARIANT::from(5u32)))).is_err());
+        assert!(validate_wmi_method_return(Err(Error::from_hresult(HRESULT(
+            0x8004_1003u32 as i32
+        ))))
+        .is_err());
+        assert!(validate_wmi_method_return(Ok(Some(VARIANT::new()))).is_err());
+        assert!(validate_wmi_method_return(Ok(Some(VARIANT::from("not a result")))).is_err());
+    }
     use crate::engine::confirm_change;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -1330,6 +1665,99 @@ mod tests {
             value: 72,
             max: 100,
         }
+    }
+
+    #[test]
+    fn recovery_rebind_uses_journal_ranges_and_identity_without_sampling() {
+        let entries = [
+            Device {
+                min: 7,
+                value: 59,
+                max: 93,
+                ..device("ddc:TYPE_C", Kind::External)
+            },
+            Device {
+                min: 2,
+                value: 73,
+                max: 120,
+                ..device("ddc:hdmi", Kind::External)
+            },
+            device("wmi:internal", Kind::Internal),
+        ];
+        let before = entries.iter().map(|d| d.value).collect::<Vec<_>>();
+        // The binding API receives resource identities, never a live brightness
+        // reader. Reordered enumeration cannot change the journal's values.
+        let candidates = BTreeMap::from([
+            ("ddc:hdmi".into(), 12usize),
+            ("ddc:type_c".into(), 34usize),
+            ("ddc:other".into(), 56usize),
+        ]);
+        let (physical, ranges) = bind_external_baselines(&entries, candidates);
+        assert_eq!(
+            physical,
+            BTreeMap::from([("ddc:TYPE_C".into(), 34), ("ddc:hdmi".into(), 12)])
+        );
+        assert_eq!(ranges["ddc:TYPE_C"], (7, 93));
+        assert_eq!(ranges["ddc:hdmi"], (2, 120));
+        assert_eq!(entries.iter().map(|d| d.value).collect::<Vec<_>>(), before);
+        let (physical, ranges) = bind_external_baselines::<usize>(&entries, BTreeMap::new());
+        assert!(physical.is_empty() && ranges.is_empty());
+    }
+
+    #[test]
+    fn rebind_rejects_unauthorized_duplicate_and_invalid_baselines_before_discovery() {
+        let mut native = Native::restricted_to(vec!["ddc:type_c".into()]).unwrap();
+        for entries in [
+            vec![device("ddc:hdmi", Kind::External)],
+            vec![
+                device("ddc:type_c", Kind::External),
+                device("ddc:TYPE_C", Kind::External),
+            ],
+            vec![Device {
+                value: 101,
+                ..device("ddc:type_c", Kind::External)
+            }],
+        ] {
+            assert!(native.rebind_brightness(&entries).is_err());
+        }
+        assert_eq!(native.stats().restore_rebinds, 0);
+        assert_eq!(native.stats().full_scans, 0);
+        let mut fake = Native::new(true);
+        fake.snapshot = Some(Vec::new());
+        fake.prepare_restore(&[device("ddc:type_c", Kind::External)], false)
+            .unwrap();
+        assert_eq!(fake.stats().restore_rebinds, 1);
+        assert_eq!(fake.stats().full_scans, 0);
+        assert!(fake.snapshot.is_none());
+    }
+
+    #[test]
+    fn repeated_topology_identity_is_refused_before_physical_or_hdr_calls() {
+        let target = Target {
+            id: "type_c".into(),
+            source: "display3".into(),
+            name: "Type_C".into(),
+            adapter: LUID {
+                LowPart: 1,
+                HighPart: 0,
+            },
+            target: 42,
+            internal: false,
+        };
+        let duplicate = Target {
+            id: "TYPE_C".into(),
+            source: "display4".into(),
+            ..target.clone()
+        };
+        assert!(validate_target_identities(std::slice::from_ref(&target)).is_ok());
+        let error = discover_external(
+            &[target, duplicate],
+            ScanRequest::all(),
+            &DeviceAccess::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("重复设备身份"));
     }
 
     #[test]
@@ -1384,6 +1812,38 @@ mod tests {
         assert!(!selected.allows("ddc:hdmi", Kind::External));
         assert!(!selected.allows("hdr:type_c", Kind::Hdr));
         assert!(!selected.includes(Kind::Internal));
+    }
+
+    #[test]
+    fn display_selection_intersects_restrictions_before_physical_or_wmi_access() {
+        let a = r"\\?\DISPLAY#ACM1000#5&abc&0&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        let b = a.replace("UID4352", "UID4353");
+        let internal = r"\\?\DISPLAY#BOE1000#4&def&0&UID256#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        let selected = DeviceAccess::restricted(vec![format!("ddc:{a}")])
+            .unwrap()
+            .selected(Some(&[a.into(), internal.into()]));
+        assert!(selected.allows(&format!("ddc:{a}"), Kind::External));
+        assert!(!selected.allows(&format!("ddc:{b}"), Kind::External));
+        assert!(!selected.allows(&format!("hdr:{a}"), Kind::Hdr));
+        assert!(!selected.allows(r"wmi:DISPLAY\BOE1000\4&def&0&UID256_0", Kind::Internal));
+        assert!(selected.wmi_query(true).is_none());
+        let empty = DeviceAccess::default().selected(Some(&[]));
+        for kind in [Kind::External, Kind::Internal, Kind::Hdr] {
+            assert!(!empty.includes(kind));
+        }
+        let missing = DeviceAccess::default().selected(Some(&[b]));
+        assert!(!missing.allows(&format!("ddc:{a}"), Kind::External));
+        assert!(!missing.allows(&format!("hdr:{a}"), Kind::Hdr));
+        let query = DeviceAccess::default()
+            .selected(Some(&[internal.into()]))
+            .wmi_query(true)
+            .unwrap();
+        assert_eq!(query, "SELECT * FROM WmiMonitorBrightness WHERE Active = TRUE AND (InstanceName = 'display\\\\boe1000\\\\4&def&0&uid256_0')");
+        assert!(!query.contains("ACM1000"));
+        assert_eq!(
+            DeviceAccess::default().wmi_query(true).unwrap(),
+            "SELECT * FROM WmiMonitorBrightness WHERE Active = TRUE"
+        );
     }
 
     #[test]

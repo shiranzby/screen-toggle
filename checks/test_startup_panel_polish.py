@@ -44,9 +44,12 @@ def main():
         assert not ui.u.IsWindowEnabled(d.hwnd)
         title=ui.window_text(ui.control(d.pid,dialog,10))
         body=ui.window_text(ui.control(d.pid,dialog,11))
-        assert title=='一键熄屏 · Rust 0.3.0'
+        version=(Path(__file__).resolve().parents[1]/'VERSION').read_text(encoding='utf-8').strip()
+        assert title=='一键熄屏 · Rust '+version
         assert all(word in body for word in ['Rust','DDC/CI','WMI','黑窗','恢复'])
         assert not any(word in body for word in ['Fluent','WinUI','风格'])
+        assert 'shiranzby' in ui.window_text(ui.control(d.pid,dialog,12))
+        assert ui.window_text(ui.control(d.pid,dialog,13))=='github.com/shiranzby/screen-toggle'
         d.shot(name,dialog)
         return dialog
     try:

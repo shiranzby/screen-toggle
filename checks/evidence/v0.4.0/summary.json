@@ -1,0 +1,151 @@
+{
+  "version": "0.4.0",
+  "artifact": "screen-toggle-v0.4.0-windows-x64.exe",
+  "sha256": "08485c627b1b00a888d94ed95ec50119457731785821dd36d1c2238cdbd3ae17",
+  "size_bytes": 758784,
+  "checks": {
+    "fmt": true,
+    "clippy_all_targets_all_features": true,
+    "release_build": true,
+    "lib_tests": 45,
+    "binary_tests": 13,
+    "display_selection_tests": 5,
+    "recovery_tests": 4
+  },
+  "ui": {
+    "startup-ui": {
+      "pass": true,
+      "cases": [
+        {
+          "case": "merged_autostart_silent_only_on_startup_command_manual_always_visible",
+          "pass": true
+        },
+        {
+          "case": "no_scrollbar_with_wheel_keyboard_and_theme_switch",
+          "pass": true
+        },
+        {
+          "case": "quiet_about_content_ok_escape_close_and_resource_release",
+          "pass": true,
+          "gdi_before": 57,
+          "gdi_after": 55,
+          "sound_evidence": "About uses a custom window, not MessageBox/MessageBeep; audio loopback not recorded"
+        }
+      ],
+      "exit_code": 0,
+      "scope": "isolated profile, bounded window messages, Type-C placement; no input injection"
+    },
+    "selection-ui": {
+      "pass": true,
+      "cases": [
+        {
+          "case": "same_row_independent_external_internal_switches",
+          "pass": true
+        },
+        {
+          "case": "cancel_no_write_save_stable_identity_restart_zero_selection_rejected",
+          "pass": true
+        },
+        {
+          "case": "all_mode_light_theme_disconnected_identity_kept_no_fallback",
+          "pass": true
+        },
+        {
+          "case": "many_display_pages_preserve_all_selected_identities",
+          "pass": true
+        }
+      ],
+      "exit_code": 0,
+      "scope": "isolated profile, bounded window messages, Type-C placement; no input injection"
+    },
+    "trigger-ui": {
+      "pass": true,
+      "cases": [
+        {
+          "case": "independent_global_desktop_recording_mouse_keyboard_double_flags_duplicate_rejection_restart",
+          "pass": true
+        }
+      ],
+      "exit_code": 0,
+      "scope": "isolated profile, bounded window messages, Type-C placement; no input injection"
+    }
+  },
+  "resources": {
+    "sha256": "08485c627b1b00a888d94ed95ec50119457731785821dd36d1c2238cdbd3ae17",
+    "native_backend": true,
+    "scope": "tray only; empty isolated recovery; no brightness requests, panel or input",
+    "working_set_trimmed": false,
+    "measurements": [
+      {
+        "seconds": 1,
+        "private_commit_bytes": 2506752,
+        "working_set_bytes": 13541376,
+        "gdi_objects": 10,
+        "user_objects": 7,
+        "handles": 180
+      },
+      {
+        "seconds": 2,
+        "private_commit_bytes": 2506752,
+        "working_set_bytes": 13541376,
+        "gdi_objects": 10,
+        "user_objects": 7,
+        "handles": 180
+      },
+      {
+        "seconds": 3,
+        "private_commit_bytes": 2506752,
+        "working_set_bytes": 13541376,
+        "gdi_objects": 10,
+        "user_objects": 7,
+        "handles": 180
+      }
+    ],
+    "pass": true,
+    "exit_code": 0
+  },
+  "native": {
+    "scope": "one Type-C external display; selected identity intersects hardware allowlist; no HDMI",
+    "rounds": [
+      {
+        "round": 1,
+        "dark": {
+          "requested_to_complete_ms": 190.6053,
+          "hardware_ms": 104,
+          "presentation_ms": 21.9694,
+          "trace_observed_ms": 206.31919999141246
+        },
+        "light": {
+          "requested_to_complete_ms": 106.295,
+          "hardware_ms": 104,
+          "presentation_ms": 60.4593,
+          "trace_observed_ms": 155.6737999926554
+        }
+      },
+      {
+        "round": 2,
+        "dark": {
+          "requested_to_complete_ms": 184.7958,
+          "hardware_ms": 103,
+          "presentation_ms": 19.5006,
+          "trace_observed_ms": 206.62440000160132
+        },
+        "light": {
+          "requested_to_complete_ms": 118.92909999999999,
+          "hardware_ms": 117,
+          "presentation_ms": 73.34140000000001,
+          "trace_observed_ms": 157.8395999968052
+        }
+      }
+    ],
+    "baseline_restored": true,
+    "pending_recovery": false,
+    "exit_code": 0
+  },
+  "limits": [
+    "no Twinkle Tray performance measurement",
+    "no new three-screen/HDR/hotplug test",
+    "new physical double-click wake not manually repeated",
+    "third-party remote detection remains incomplete"
+  ]
+}

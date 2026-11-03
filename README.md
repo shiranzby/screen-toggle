@@ -4,17 +4,19 @@
 
 通过全屏黑色覆盖窗与显示器亮度控制，使屏幕变暗，同时让系统、下载任务和远程桌面继续运行。适合需要暂时隐藏本机画面、又希望电脑继续工作的场景。
 
-[下载 v0.3.0](https://github.com/shiranzby/screen-toggle/releases/tag/v0.3.0) · [更新记录](CHANGELOG.md) · [代码架构](docs/ARCHITECTURE.md) · [验证与性能口径](docs/VALIDATION.md)
+[下载 v0.4.0](https://github.com/shiranzby/screen-toggle/releases/tag/v0.4.0) · [更新记录](CHANGELOG.md) · [代码架构](docs/ARCHITECTURE.md) · [验证与性能口径](docs/VALIDATION.md) · [Twinkle Tray 对比与路线图](docs/TWINKLE_TRAY_COMPARISON.md)
+
+v0.4.0 增加两套独立的全局／桌面键盘或鼠标触发、单双击开关与逐屏选择，修复 HDR 和 WMI 相关恢复问题。黑屏后同一桌面手势可亮屏；内外屏调光开关合并为一行。桌面触发默认关闭，亮屏时排除图标、其它窗口和酷呆接管区域。详见[恢复说明](docs/RECOVERY_AND_MOUSE.md)与[选屏说明](docs/DISPLAY_SELECTION.md)。
 
 ## 设置面板
 
-支持浅色、深色和跟随系统三种主题。以下为用户提供的设置面板截图，图中热键与开关状态为示例配置。
+支持浅色、深色和跟随系统三种主题。以下为 v0.4.0 隔离测试模式下的真实面板截图，热键与开关为示例配置，截图过程不修改真实亮度。
 
 <table>
   <tr><th width="50%">浅色</th><th width="50%">深色</th></tr>
   <tr>
-    <td><img src="docs/images/settings-light.png" alt="screen-toggle 浅色设置面板" width="100%"></td>
-    <td><img src="docs/images/settings-dark.png" alt="screen-toggle 深色设置面板" width="100%"></td>
+    <td><img src="docs/images/settings-v0.4-light.png" alt="screen-toggle v0.4.0 浅色设置面板" width="100%"></td>
+    <td><img src="docs/images/settings-v0.4-dark.png" alt="screen-toggle v0.4.0 深色设置面板" width="100%"></td>
   </tr>
 </table>
 
@@ -23,12 +25,11 @@
 ### 原生、轻量
 
 - **Rust + windows-rs + Win32 API**，默认采用 GDI/GDI+ 绘制界面。
-- 发布文件约 **635 KiB**，下载一个 EXE 即可使用。
+- v0.4.0 发布文件约 **741 KiB**，下载一个 EXE 即可使用。
 - 运行时无需安装 Python、.NET、Qt、Electron、WebView 或 XAML 框架。
-- 托盘冷启动实测私有提交内存约 **2.38 MiB**，工作集约 **13.26 MiB**；打开设置页后分别约 **3.11 MiB** 和 **17.28 MiB**。
-- 设置页连续隐藏、显示 50 次后，GDI、USER 对象和句柄数量未净增长。
+- v0.4.0 托盘冷启动实测私有提交约 **2.39 MiB**，工作集约 **12.91 MiB**。这是默认输入配置下的托盘样本；启用监听、显示设置或操作硬件后的占用可能更高。
 
-内存数字来自 v0.3.0 单机采样，没有主动裁剪工作集。私有提交和工作集是两种不同指标，实际占用会随 Windows、显示器与界面使用情况变化。[查看测量条件](docs/VALIDATION.md#资源占用)
+以上来自本发布构建的单机采样，没有主动裁剪工作集。私有提交和工作集是不同指标，也未对 Twinkle Tray 做同环境资源测量。[查看测量条件](docs/VALIDATION.md#资源占用)
 
 ### 快速切换，多屏并行
 
@@ -36,7 +37,7 @@
 - 黑窗与光标策略在同一个 UI 操作中切换；恢复时也一起提交。
 - 外接屏通过 **DDC/CI** 调光，内置屏通过 **WMI** 调光；不同设备并行，同一设备的请求保持顺序。
 - 默认亮屏方式为“写入完成即撤窗”：全部目标写入成功后恢复桌面和光标，后台继续精确回读。
-- v0.3.0 在一台 Type-C 显示器上的单轮测量中，首次观察到桌面恢复约 **156 ms**，完整请求约 **192 ms**。这两个数字分别描述可见恢复与后台确认结束，不是显示器面板的物理响应时间。
+- v0.4.0 的 Type-C 两轮正常亮屏测试，引擎到 UI 恢复确认约 **60–73 ms**，完整请求约 **106–119 ms**；硬件批次含精确回读约 **104–117 ms**。这是单屏两轮样本，不是面板物理响应或所有多屏组合的保证。
 
 速度受显示器固件、DDC/CI、驱动和 WMI 实现影响。[查看计时边界](docs/VALIDATION.md#切换延迟)
 
@@ -53,9 +54,12 @@
 | 设置 | 作用 |
 | --- | --- |
 | 全局热键 | 默认 `Ctrl + Alt + S`；点击录入后可修改，`Esc` 取消 |
+| 桌面热键 | 独立启用，可录键盘、左／右／中键与侧键；桌面空白触发，黑屏时在覆盖区亮屏 |
+| 双击触发 | 全局与桌面分别设置，开启后连续按两次，关闭后按一次 |
 | 面板主题 | 浅色、深色、跟随系统 |
 | 熄屏时光标 | 自动判断、始终隐藏、始终保留；亮屏时恢复指针 |
 | 外接屏 / 内置屏 | 分别选择是否通过 DDC/CI、WMI 压暗背光 |
+| 切换屏幕 | 全部屏幕或指定屏幕，按完整身份保存；断连不自动换目标 |
 | 关闭 HDR | 熄屏时关闭，亮屏时恢复原状态 |
 | 熄屏顺序 | 先黑后熄、先熄后黑、淡入并行 |
 | 亮屏方式 | 写入完成即撤窗，或完整确认后追加固定延迟 |
@@ -66,9 +70,11 @@
 
 “自动判断”只接受本机正在被控制的桌面会话证据。第三方远控适配尚有未验证边界；需要远控时稳定保留光标，可直接选择“始终保留”。
 
+只切换部分屏幕时保留全局指针，方便使用其余屏幕。通用亮度滑块、校准曲线、应用配置与其它 DDC 功能属于[后续计划](docs/TWINKLE_TRAY_COMPARISON.md)，尚未实现。
+
 ## 下载与使用
 
-1. 打开 [Releases](https://github.com/shiranzby/screen-toggle/releases)，下载 `screen-toggle-v0.3.0-windows-x64.exe`。当前提供 Windows x64 版本，面向 Windows 10/11。
+1. 打开 [Releases](https://github.com/shiranzby/screen-toggle/releases)，下载 `screen-toggle-v0.4.0-windows-x64.exe`。当前提供 Windows x64 版本，面向 Windows 10/11。
 2. 双击打开设置页，按需选择内置屏、外接屏、光标和亮屏方式。更改自动保存。
 3. 按 `Ctrl + Alt + S` 或点击“立即熄屏”；再次执行即可恢复。也可通过托盘菜单操作。
 4. 需要登录后后台运行时，启用“开机静默启动”。关闭面板默认隐藏到托盘。
@@ -76,13 +82,13 @@
 正常使用无需开发环境。可用下列命令核对下载文件，并与 Release 中的 `.sha256` 文件比较：
 
 ```powershell
-Get-FileHash .\screen-toggle-v0.3.0-windows-x64.exe -Algorithm SHA256
+Get-FileHash .\screen-toggle-v0.4.0-windows-x64.exe -Algorithm SHA256
 ```
 
 后台启动：
 
 ```powershell
-.\screen-toggle-v0.3.0-windows-x64.exe --silent
+.\screen-toggle-v0.4.0-windows-x64.exe --silent
 ```
 
 已有后台实例时，手动双击会重新显示设置页。
@@ -99,14 +105,14 @@ Get-FileHash .\screen-toggle-v0.3.0-windows-x64.exe -Algorithm SHA256
 需要独立配置时，可指定绝对路径：
 
 ```powershell
-.\screen-toggle-v0.3.0-windows-x64.exe --data-dir "C:\ScreenToggleProfile"
+.\screen-toggle-v0.4.0-windows-x64.exe --data-dir "C:\ScreenToggleProfile"
 ```
 
 如果恢复失败，先保持显示器连接，再尝试恢复或正常退出。程序下次启动会处理未完成的恢复记录；不要手动删除仍有待恢复设备的 `recovery.json`。
 
 ## 工作原理
 
-1. **软件遮挡**：创建覆盖各显示器的黑窗，并应用光标策略。黑窗允许点击穿透，并请求 Windows 将其排除在屏幕捕获之外，便于远程操作；实际捕获结果取决于系统与远控软件的捕获路径。
+1. **软件遮挡**：按所选显示器的区域创建黑窗，并应用光标策略。黑窗允许点击穿透，并请求 Windows 将其排除在屏幕捕获之外，便于远程操作；实际捕获结果取决于系统与远控软件的捕获路径。
 2. **背光调节**：读取设备原状态，保存恢复记录，再通过 DDC/CI 或 WMI 压暗。多块显示器独立并行执行。
 3. **恢复显示**：向设备写回原值。默认在所有写入成功后撤掉黑窗、恢复光标，后台继续回读；只有确认成功才清除恢复记录。
 
@@ -139,17 +145,21 @@ screen-toggle/
 │  │  ├─ schedule.rs      # 每日定时和手动操作优先策略
 │  │  ├─ theme.rs         # 浅色/深色/系统配色
 │  │  ├─ about.rs         # 关于窗口
+│  │  ├─ desktop_mouse.rs # 输入钩子、桌面命中与黑屏唤醒门禁
+│  │  ├─ display_picker.rs # 逐屏选择窗口与分页
 │  │  ├─ antialias.rs     # GDI+ 抗锯齿绘制
 │  │  ├─ d2d.rs           # 可选 Direct2D 绘制实验
 │  │  ├─ win.rs           # 通用 Win32 窗口、字体与字符串辅助
 │  │  └─ lib.rs           # 领域逻辑与后端的库入口
+│  ├─ tests/              # 恢复失败与屏幕选择集成反例
 │  └─ examples/           # 调度与硬件链路诊断程序
 ├─ checks/                # 构建、UI、资源与硬件验证脚本
 │  └─ evidence/           # 当前发布版本的少量验证结果
 ├─ docs/
 │  ├─ images/             # README 使用的真实面板截图
 │  ├─ ARCHITECTURE.md     # 模块边界、线程和操作链路
-│  └─ VALIDATION.md       # 测量条件、结果与验证范围
+│  ├─ VALIDATION.md       # 测量条件、结果与验证范围
+│  └─ TWINKLE_TRAY_COMPARISON.md # 功能、架构与扩展路线
 ├─ build.bat              # Windows 一键构建入口
 ├─ start.bat              # 启动本地构建产物
 ├─ CHANGELOG.md           # 版本变化
@@ -157,7 +167,7 @@ screen-toggle/
 └─ LICENSE                # MIT License
 ```
 
-旧应用实现、临时补丁工具、原型和重复源码副本已从发布树移除。历史 Rust 版本通过 `v0.1.0`、`v0.2.0`、`v0.3.0` 三个 Git 标签查看，当前开发代码位于 `rust/`。更多设计说明见 [ARCHITECTURE](docs/ARCHITECTURE.md)。
+历史 Rust 版本通过各自的 Git 标签查看，不在当前分支重复堆放源码。当前开发代码位于 `rust/`。更多设计说明见 [ARCHITECTURE](docs/ARCHITECTURE.md)。
 
 ## 本地构建
 
@@ -200,7 +210,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\checks\build_release.p
 | `v0.1.0` | 首个 Rust 实现，保留早期一键熄屏交互 |
 | `v0.2.0` | 重构设备与恢复链路、并行 DDC/WMI、完善设置页和主题 |
 | `v0.3.0` | 普通亮屏增加写入成功后的提前显示，后台继续回读确认 |
+| `v0.4.0` | 逐屏选择、两套键鼠单双击触发、黑屏手势亮屏，以及 HDR/WMI 恢复修复 |
 
-仓库历史保留三个发布提交。二进制由 [GitHub Releases](https://github.com/shiranzby/screen-toggle/releases) 分发，验证范围与已知限制见 [VALIDATION](docs/VALIDATION.md)。
+仓库每个版本保留一个发布提交，`v0.3.0 → v0.4.0` 只有一个新增提交。二进制由 [GitHub Releases](https://github.com/shiranzby/screen-toggle/releases) 分发，验证范围与已知限制见 [VALIDATION](docs/VALIDATION.md)。
 
 作者：[shiranzby](https://github.com/shiranzby)。采用 [MIT License](LICENSE)。

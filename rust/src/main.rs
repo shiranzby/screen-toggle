@@ -4,6 +4,8 @@ mod antialias;
 mod app;
 #[cfg(feature = "direct2d")]
 mod d2d;
+mod desktop_mouse;
+mod display_picker;
 mod panel;
 mod theme;
 mod win;

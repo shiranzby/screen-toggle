@@ -40,6 +40,8 @@ const WM_REPORT: u32 = WM_APP + 4;
 const WM_SHOW: u32 = WM_APP + 5;
 const WM_CAPTURE_KEY: u32 = WM_APP + 6;
 const WM_RELEASE_HOOK: u32 = WM_APP + 7;
+const WM_DESKTOP_TOGGLE: u32 = WM_APP + 8;
+const WM_DISPLAY_SELECTION: u32 = WM_APP + 9;
 const WM_TRAY: u32 = WM_APP + 1;
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 const TIMER_CLOCK: usize = 1;
@@ -104,8 +106,12 @@ impl Options {
         if !dir.is_absolute() {
             return Err("--data-dir 必须是绝对路径".into());
         }
+        // Resolve aliases once before choosing the mutex. Two spellings of one
+        // profile must never run separate hardware engines against its journal.
+        let identity = canonical_profile(dir.clone())?;
         let mut hasher = DefaultHasher::new();
-        dir.to_string_lossy()
+        identity
+            .to_string_lossy()
             .replace('/', "\\")
             .to_lowercase()
             .hash(&mut hasher);
@@ -120,6 +126,34 @@ impl Options {
             probe,
         })
     }
+}
+fn trigger_press(first: &mut Option<u32>, double: bool, now: u32, interval: u32) -> bool {
+    if !double {
+        *first = None;
+        return true;
+    }
+    if first
+        .take()
+        .is_some_and(|previous| now.wrapping_sub(previous) <= interval)
+    {
+        true
+    } else {
+        *first = Some(now);
+        false
+    }
+}
+fn canonical_profile(dir: PathBuf) -> Result<PathBuf, String> {
+    fs::create_dir_all(&dir).map_err(|e| format!("无法准备数据目录：{e}"))?;
+    let resolved = fs::canonicalize(&dir).map_err(|e| format!("无法确认数据目录身份：{e}"))?;
+    // Keep the normal spelling compatible with the previous release's mutex.
+    let text = resolved.to_string_lossy();
+    Ok(if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(path) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(path)
+    } else {
+        resolved
+    })
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Operation {
@@ -158,7 +192,10 @@ struct App {
     owner: HWND,
     settings: HWND,
     about: HWND,
+    display_picker: HWND,
     overlay: HWND,
+    displays: Vec<sog::native::DisplayInfo>,
+    dark_selection: Option<Vec<String>>,
     cursor_hidden: bool,
     presentation_trace: Vec<serde_json::Value>,
     opts: Options,
@@ -168,8 +205,12 @@ struct App {
     reserved: Option<i32>,
     hotkey_id: i32,
     capture: bool,
+    capture_target: i32,
     hook: HHOOK,
+    mouse_capture_hook: HHOOK,
     captured_down: u32,
+    captured_mouse_down: u32,
+    first_hotkey: Option<u32>,
     desired: bool,
     phase: &'static str,
     ready: bool,
@@ -185,6 +226,11 @@ struct App {
     message: String,
     taskbar: u32,
     tray_v4: bool,
+    desktop_mouse: Option<(
+        crate::desktop_mouse::Bindings,
+        crate::desktop_mouse::DesktopMouse,
+    )>,
+    mouse_token: usize,
 }
 thread_local! {static UI:RefCell<Option<App>>=const{RefCell::new(None)};}
 // Callbacks below only copy or update Rust values in this closure.
@@ -443,12 +489,22 @@ impl<B: Backend> Backend for Presented<B> {
     fn scan_required(&mut self, request: ScanRequest) -> Result<Inventory, String> {
         self.inner.scan_required(request)
     }
+    fn scan_selected(
+        &mut self,
+        request: ScanRequest,
+        selected: Option<&[String]>,
+    ) -> Result<Inventory, String> {
+        self.inner.scan_selected(request, selected)
+    }
     fn prepare_restore(
         &mut self,
         entries: &[Device],
         allow_reuse: bool,
     ) -> Result<Vec<String>, String> {
         self.inner.prepare_restore(entries, allow_reuse)
+    }
+    fn rebind_brightness(&mut self, entries: &[Device]) -> Result<Vec<String>, String> {
+        self.inner.rebind_brightness(entries)
     }
     fn read(&mut self, id: &str, kind: Kind) -> Result<u32, String> {
         self.inner.read(id, kind)
@@ -678,6 +734,9 @@ fn worker<B: Backend>(
 }
 
 unsafe fn register_hotkey(owner: HWND, id: i32, key: Hotkey) -> Result<(), String> {
+    if key.is_mouse() {
+        return Ok(());
+    }
     RegisterHotKey(
         owner,
         id,
@@ -708,6 +767,7 @@ fn publish() {
         value["effective_theme"] = unsafe { p::effective_dark(panel) }
             .map(|dark| if dark { "dark" } else { "light" })
             .into();
+        value["displays"] = state(|s| serde_json::json!(s.displays)).unwrap_or_default();
         let _ = storage::atomic_json(&dir.join("status.json"), &value);
     }
 }
@@ -720,6 +780,66 @@ unsafe fn refresh(force: bool) {
         p::set_busy(h, busy);
     }
 }
+fn sync_desktop_mouse() {
+    let update = state(|s| {
+        let bindings = crate::desktop_mouse::Bindings {
+            global_mouse: s
+                .saved
+                .hotkey
+                .is_mouse()
+                .then_some((s.saved.hotkey, s.saved.hotkey_double_click)),
+            desktop: s
+                .saved
+                .desktop_trigger_enabled
+                .then_some((s.saved.desktop_hotkey, s.saved.desktop_double_click)),
+        };
+        let enabled = (bindings.global_mouse.is_some() || bindings.desktop.is_some())
+            && !s.opts.test
+            && !s.exiting
+            && !s.capture
+            && s.display_picker.0.is_null()
+            && s.captured_down == 0
+            && s.captured_mouse_down == 0;
+        if (enabled
+            && s.desktop_mouse
+                .as_ref()
+                .is_some_and(|(current, _)| *current == bindings))
+            || (!enabled && s.desktop_mouse.is_none())
+        {
+            return None;
+        }
+        s.mouse_token = s.mouse_token.wrapping_add(1);
+        Some((
+            s.desktop_mouse.take(),
+            enabled,
+            bindings,
+            s.owner,
+            s.mouse_token,
+        ))
+    })
+    .flatten();
+    let Some((old, enabled, bindings, owner, token)) = update else {
+        return;
+    };
+    drop(old);
+    if enabled {
+        use crate::desktop_mouse::DesktopMouse;
+        match DesktopMouse::start(owner, WM_DESKTOP_TOGGLE, bindings, token) {
+            Ok(listener) => {
+                listener.set_dark(state(|s| !s.overlay.0.is_null()).unwrap_or(false));
+                state(|s| s.desktop_mouse = Some((bindings, listener)));
+                if let Some(note) = bindings
+                    .desktop
+                    .and_then(|_| crate::desktop_mouse::compatibility_note())
+                {
+                    feedback(note);
+                }
+            }
+            Err(error) => feedback(error),
+        }
+    }
+}
+
 fn save_draft() {
     let work = state(|s| {
         if s.saving || s.draft == s.saved {
@@ -747,20 +867,102 @@ unsafe fn cancel_capture() {
     .unwrap_or(false);
     stop_hook();
     if changed {
-        let (h, key) = state(|s| (s.settings, s.draft.hotkey.label())).unwrap();
-        p::set_capture(h, false, &key);
+        let (h, target, key) = state(|s| {
+            (
+                s.settings,
+                s.capture_target,
+                if s.capture_target == p::DESKTOP_HOTKEY {
+                    s.draft.desktop_hotkey
+                } else {
+                    s.draft.hotkey
+                },
+            )
+        })
+        .unwrap();
+        p::set_capture(h, target, false, &key.label());
         feedback("已取消快捷键录入");
     }
+    sync_desktop_mouse();
 }
 unsafe fn stop_hook() {
-    let hook = state(|s| {
+    let hooks = state(|s| {
         s.captured_down = 0;
-        std::mem::take(&mut s.hook)
+        s.captured_mouse_down = 0;
+        (
+            std::mem::take(&mut s.hook),
+            std::mem::take(&mut s.mouse_capture_hook),
+        )
     })
     .unwrap_or_default();
-    if !hook.0.is_null() {
-        let _ = UnhookWindowsHookEx(hook);
+    for hook in [hooks.0, hooks.1] {
+        if !hook.0.is_null() {
+            let _ = UnhookWindowsHookEx(hook);
+        }
     }
+}
+unsafe extern "system" fn capture_mouse(code: i32, wparam: WPARAM, l: LPARAM) -> LRESULT {
+    if code < 0 {
+        return CallNextHookEx(None, code, wparam, l);
+    }
+    let event = &*(l.0 as *const MSLLHOOKSTRUCT);
+    let button = match wparam.0 as u32 {
+        WM_LBUTTONDOWN | WM_LBUTTONUP => Some((1, wparam.0 as u32 == WM_LBUTTONDOWN)),
+        WM_RBUTTONDOWN | WM_RBUTTONUP => Some((2, wparam.0 as u32 == WM_RBUTTONDOWN)),
+        WM_MBUTTONDOWN | WM_MBUTTONUP => Some((4, wparam.0 as u32 == WM_MBUTTONDOWN)),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => match event.mouseData >> 16 {
+            1 => Some((5, wparam.0 as u32 == WM_XBUTTONDOWN)),
+            2 => Some((6, wparam.0 as u32 == WM_XBUTTONDOWN)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((key, down)) = button {
+        let action = state(|s| {
+            let interested = s.capture || s.captured_mouse_down == key;
+            let post = interested && down && s.capture && s.captured_mouse_down == 0;
+            if interested {
+                s.captured_mouse_down = if down { key } else { 0 };
+            }
+            (interested, post, !down && !s.capture, s.owner)
+        })
+        .unwrap_or_default();
+        if action.0 {
+            if action.1 {
+                let mods = capture_modifiers(true);
+                let _ = PostMessageW(
+                    action.3,
+                    WM_CAPTURE_KEY,
+                    WPARAM(key as usize),
+                    LPARAM(mods as isize),
+                );
+            }
+            if action.2 {
+                let _ = PostMessageW(action.3, WM_RELEASE_HOOK, WPARAM(0), LPARAM(0));
+            }
+            return LRESULT(1);
+        }
+    }
+    CallNextHookEx(None, code, wparam, l)
+}
+unsafe fn capture_modifiers(asynchronous: bool) -> u32 {
+    let mut modifiers = 0;
+    for (key, bit) in [
+        (VK_CONTROL, 2),
+        (VK_MENU, 1),
+        (VK_SHIFT, 4),
+        (VK_LWIN, 8),
+        (VK_RWIN, 8),
+    ] {
+        if (if asynchronous {
+            GetAsyncKeyState(key.0 as i32)
+        } else {
+            GetKeyState(key.0 as i32)
+        }) < 0
+        {
+            modifiers |= bit;
+        }
+    }
+    modifiers
 }
 unsafe extern "system" fn capture_hook(code: i32, wparam: WPARAM, l: LPARAM) -> LRESULT {
     if code < 0 {
@@ -834,11 +1036,17 @@ unsafe fn capture_key(key: u32, modifiers: Option<u32>) -> bool {
         feedback(e);
         return true;
     }
-    let (owner, id, old) = state(|s| {
+    let (owner, id, target, old, mut candidate) = state(|s| {
         (
             s.owner,
             if s.hotkey_id == 1 { 2 } else { 1 },
-            s.saved.hotkey,
+            s.capture_target,
+            if s.capture_target == p::DESKTOP_HOTKEY {
+                s.saved.desktop_hotkey
+            } else {
+                s.saved.hotkey
+            },
+            s.draft.clone(),
         )
     })
     .unwrap();
@@ -846,17 +1054,31 @@ unsafe fn capture_key(key: u32, modifiers: Option<u32>) -> bool {
         cancel_capture();
         return true;
     }
-    if let Err(e) = register_hotkey(owner, id, hotkey) {
-        feedback(e);
+    if target == p::DESKTOP_HOTKEY {
+        candidate.desktop_hotkey = hotkey;
+    } else {
+        candidate.hotkey = hotkey;
+    }
+    if let Err(error) = candidate.validate() {
+        feedback(error);
         return true;
+    }
+    if target == p::HOTKEY {
+        if let Err(e) = register_hotkey(owner, id, hotkey) {
+            feedback(e);
+            return true;
+        }
     }
     state(|s| {
         s.capture = false;
-        s.reserved = Some(id);
-        s.draft.hotkey = hotkey;
+        if target == p::HOTKEY {
+            s.reserved = Some(id);
+        }
+        s.draft = candidate;
+        s.first_hotkey = None;
     });
     let h = state(|s| s.settings).unwrap_or_default();
-    p::set_capture(h, false, &hotkey.label());
+    p::set_capture(h, target, false, &hotkey.label());
     refresh(true);
     save_draft();
     true
@@ -940,6 +1162,54 @@ unsafe fn about() {
         Err(error) => feedback(error),
     }
 }
+unsafe fn show_display_picker() {
+    cancel_capture();
+    let existing = state(|s| s.display_picker).unwrap_or_default();
+    if IsWindow(existing).as_bool() {
+        return;
+    }
+    let displays = match sog::native::displays() {
+        Ok(displays) => displays,
+        Err(error) => {
+            feedback(error);
+            return;
+        }
+    };
+    state(|s| s.displays = displays.clone());
+    let (parent, callback, cfg, test) = state(|s| {
+        (
+            if s.settings.0.is_null() {
+                s.owner
+            } else {
+                s.settings
+            },
+            s.owner,
+            s.draft.clone(),
+            s.opts.test,
+        )
+    })
+    .unwrap();
+    let dark = cfg.theme.is_dark(theme::system_dark(
+        state(|s| s.opts.test.then_some(s.opts.dir.clone()))
+            .flatten()
+            .as_deref(),
+    ));
+    match crate::display_picker::show(
+        parent,
+        callback,
+        WM_DISPLAY_SELECTION,
+        displays,
+        cfg.selected_displays,
+        theme::palette(dark),
+        !test,
+    ) {
+        Ok(picker) => {
+            state(|s| s.display_picker = picker);
+            sync_desktop_mouse();
+        }
+        Err(error) => feedback(error),
+    }
+}
 unsafe fn panel_command(wparam: WPARAM) {
     let id = (wparam.0 & 0xffff) as i32;
     let event = (wparam.0 >> 16) as u32;
@@ -947,6 +1217,10 @@ unsafe fn panel_command(wparam: WPARAM) {
         return;
     }
     match id {
+        p::SCREENS => {
+            show_display_picker();
+            return;
+        }
         p::MAXIMIZE => {
             let h = state(|s| s.settings).unwrap();
             let _ = ShowWindow(
@@ -987,24 +1261,46 @@ unsafe fn panel_command(wparam: WPARAM) {
             }
             return;
         }
-        p::HOTKEY => {
+        p::HOTKEY | p::DESKTOP_HOTKEY => {
             if state(|s| s.saving).unwrap_or(true) {
                 feedback("请等待当前设置保存完成");
                 return;
             }
-            stop_hook();
+            cancel_capture();
+            state(|s| {
+                s.capture = true;
+                s.capture_target = id;
+                s.first_hotkey = None;
+            });
+            sync_desktop_mouse();
             match SetWindowsHookExW(WH_KEYBOARD_LL, Some(capture_hook), instance(), 0) {
                 Ok(hook) => {
+                    let mouse =
+                        match SetWindowsHookExW(WH_MOUSE_LL, Some(capture_mouse), instance(), 0) {
+                            Ok(mouse) => mouse,
+                            Err(error) => {
+                                let _ = UnhookWindowsHookEx(hook);
+                                state(|s| s.capture = false);
+                                sync_desktop_mouse();
+                                feedback(format!("无法开始鼠标按键录入：{error}"));
+                                return;
+                            }
+                        };
                     let h = state(|s| {
                         s.capture = true;
                         s.hook = hook;
+                        s.mouse_capture_hook = mouse;
                         s.settings
                     })
                     .unwrap();
-                    p::set_capture(h, true, "请按组合键… · Esc 取消");
+                    p::set_capture(h, id, true, "请按键盘或鼠标键… · Esc 取消");
                     feedback("正在录入快捷键，原快捷键暂不执行");
                 }
-                Err(e) => feedback(format!("无法开始快捷键录入：{e}")),
+                Err(e) => {
+                    state(|s| s.capture = false);
+                    sync_desktop_mouse();
+                    feedback(format!("无法开始快捷键录入：{e}"));
+                }
             }
             return;
         }
@@ -1038,6 +1334,9 @@ unsafe fn panel_command(wparam: WPARAM) {
             p::HDR => cfg.hdr_off = checked(id),
             p::AUTOSTART => cfg.autostart = checked(id),
             p::SCHEDULE => cfg.schedule_enabled = checked(id),
+            p::HOTKEY_DOUBLE => cfg.hotkey_double_click = checked(id),
+            p::DESKTOP_ENABLED => cfg.desktop_trigger_enabled = checked(id),
+            p::DESKTOP_DOUBLE => cfg.desktop_double_click = checked(id),
             p::BLACK => cfg.dim_order = DimOrder::BlackFirst,
             p::DIM => cfg.dim_order = DimOrder::DimFirst,
             p::FADE => cfg.dim_order = DimOrder::Fade,
@@ -1072,22 +1371,103 @@ unsafe fn panel_command(wparam: WPARAM) {
     }
 }
 
+fn overlay_rectangles(
+    displays: &[sog::native::DisplayInfo],
+    selected: Option<&[String]>,
+    restriction: Option<&str>,
+) -> Result<Vec<[i32; 4]>, String> {
+    let included = |display: &sog::native::DisplayInfo| {
+        display_is_selected(&display.id, selected)
+            && restriction
+                .is_none_or(|id| display_is_selected(id, Some(std::slice::from_ref(&display.id))))
+    };
+    let chosen: Vec<_> = displays.iter().filter(|d| included(d)).collect();
+    if chosen.is_empty() {
+        return Err("所选屏幕当前未连接，请在“切换屏幕”中重新选择".into());
+    }
+    if chosen.iter().any(|display| {
+        displays
+            .iter()
+            .any(|other| display.source == other.source && !included(other))
+    }) {
+        return Err("镜像显示器共用同一桌面，请一起选择或先改为扩展显示".into());
+    }
+    Ok(chosen.into_iter().map(|display| display.rect).collect())
+}
+fn current_overlay_rectangles() -> Result<Vec<[i32; 4]>, String> {
+    state(|s| {
+        overlay_rectangles(
+            &s.displays,
+            s.dark_selection.as_deref(),
+            s.opts.restrict_id.as_deref(),
+        )
+    })
+    .unwrap_or_else(|| Err("屏幕状态不可用".into()))
+}
+fn has_uncovered_display(displays: &[sog::native::DisplayInfo], rectangles: &[[i32; 4]]) -> bool {
+    displays
+        .iter()
+        .any(|display| !rectangles.contains(&display.rect))
+}
+fn set_desktop_dark(dark: bool) {
+    state(|s| {
+        if let Some((_, listener)) = &s.desktop_mouse {
+            listener.set_dark(dark);
+        }
+    });
+}
+unsafe fn configure_overlay_region(h: HWND, rectangles: &[[i32; 4]]) -> Result<(), String> {
+    let first = rectangles.first().ok_or("没有可覆盖的屏幕")?;
+    let bounds = rectangles.iter().fold(*first, |a, b| {
+        [
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[2].max(b[2]),
+            a[3].max(b[3]),
+        ]
+    });
+    let region = CreateRectRgn(0, 0, 0, 0);
+    if region.0.is_null() {
+        return Err("无法创建黑窗区域".into());
+    }
+    for area in rectangles {
+        let part = CreateRectRgn(
+            area[0] - bounds[0],
+            area[1] - bounds[1],
+            area[2] - bounds[0],
+            area[3] - bounds[1],
+        );
+        let success = !part.0.is_null() && CombineRgn(region, region, part, RGN_OR) != RGN_ERROR;
+        if !part.0.is_null() {
+            let _ = DeleteObject(part);
+        }
+        if !success {
+            let _ = DeleteObject(region);
+            return Err("无法合并黑窗区域".into());
+        }
+    }
+    if SetWindowRgn(h, region, false) == 0 {
+        let _ = DeleteObject(region);
+        return Err("无法设置黑窗区域".into());
+    }
+    // USER owns the region after SetWindowRgn succeeds.
+    SetWindowPos(
+        h,
+        HWND_TOPMOST,
+        bounds[0],
+        bounds[1],
+        bounds[2] - bounds[0],
+        bounds[3] - bounds[1],
+        SWP_NOACTIVATE,
+    )
+    .map_err(|e| e.to_string())
+}
 unsafe extern "system" fn overlay_proc(h: HWND, m: u32, wparam: WPARAM, l: LPARAM) -> LRESULT {
     match m {
         WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
-        WM_DISPLAYCHANGE => {
-            let _ = SetWindowPos(
-                h,
-                HWND_TOPMOST,
-                GetSystemMetrics(SM_XVIRTUALSCREEN),
-                GetSystemMetrics(SM_YVIRTUALSCREEN),
-                GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                GetSystemMetrics(SM_CYVIRTUALSCREEN),
-                SWP_NOACTIVATE,
-            );
-            LRESULT(0)
-        }
+        // The controller owns topology and reapplies the selected region.
+        WM_DISPLAYCHANGE => LRESULT(0),
         _ => DefWindowProcW(h, m, wparam, l),
     }
 }
@@ -1110,6 +1490,7 @@ unsafe fn overlay(show: bool, hidden: bool) -> Result<(), String> {
             let _ = DestroyWindow(h);
             state(|s| s.overlay = HWND::default());
         }
+        set_desktop_dark(false);
         let window_ms = start.elapsed().as_secs_f64() * 1000.0;
         if !h.0.is_null() || restore_cursor {
             record_presentation(
@@ -1121,6 +1502,11 @@ unsafe fn overlay(show: bool, hidden: bool) -> Result<(), String> {
     if !h.0.is_null() {
         return Ok(());
     }
+    let rectangles = current_overlay_rectangles()?;
+    // System cursors are global. Preserve the pointer on screens that remain
+    // usable when only part of the desktop is covered.
+    let all_covered = state(|s| !has_uncovered_display(&s.displays, &rectangles)).unwrap_or(false);
+    let hidden = hidden && all_covered;
     register(
         "SOGRustOverlay",
         Some(overlay_proc),
@@ -1141,6 +1527,10 @@ unsafe fn overlay(show: bool, hidden: bool) -> Result<(), String> {
         None,
     )
     .map_err(|e| e.to_string())?;
+    if let Err(error) = configure_overlay_region(h, &rectangles) {
+        let _ = DestroyWindow(h);
+        return Err(error);
+    }
     let created_ms = start.elapsed().as_secs_f64() * 1000.0;
     if let Err(e) = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE) {
         let _ = DestroyWindow(h);
@@ -1168,6 +1558,7 @@ unsafe fn overlay(show: bool, hidden: bool) -> Result<(), String> {
     if !test {
         let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
     }
+    set_desktop_dark(true);
     if fade {
         SetTimer(owner, TIMER_FADE, 20, None);
     }
@@ -1194,6 +1585,9 @@ fn record_presentation(mut event: serde_json::Value) {
     }
 }
 unsafe fn toggle() {
+    if state(|s| !s.display_picker.0.is_null()).unwrap_or(false) {
+        return;
+    }
     let desired = state(|s| s.desired).unwrap_or(false);
     request(
         if desired {
@@ -1205,6 +1599,20 @@ unsafe fn toggle() {
     );
 }
 unsafe fn request(op: Operation, manual: bool) {
+    if matches!(op, Operation::Dark | Operation::Measure) {
+        let valid = state(|s| {
+            overlay_rectangles(
+                &s.displays,
+                s.saved.selected_displays.as_deref(),
+                s.opts.restrict_id.as_deref(),
+            )
+        })
+        .unwrap_or_else(|| Err("屏幕状态不可用".into()));
+        if let Err(error) = valid {
+            feedback(error);
+            return;
+        }
+    }
     let now = GetTickCount64();
     let work = state(|s| {
         if !s.ready || s.exiting || (op == Operation::Measure && s.phase != "light") {
@@ -1216,18 +1624,33 @@ unsafe fn request(op: Operation, manual: bool) {
         let generation = s.generation.fetch_add(1, Ordering::AcqRel) + 1;
         s.hardware_done = false;
         s.desired = op == Operation::Dark;
+        if op == Operation::Dark {
+            s.dark_selection = s.saved.selected_displays.clone();
+        }
         s.phase = match op {
             Operation::Dark => "darkening",
             Operation::Light => "restoring",
             Operation::Measure => "measuring",
             Operation::Quit => "exiting",
         };
+        let mut runtime_cfg = s.saved.clone();
+        if op == Operation::Dark {
+            let covered = overlay_rectangles(
+                &s.displays,
+                s.dark_selection.as_deref(),
+                s.opts.restrict_id.as_deref(),
+            )
+            .unwrap_or_default();
+            if has_uncovered_display(&s.displays, &covered) {
+                runtime_cfg.cursor_mode = CursorMode::Keep;
+            }
+        }
         Some((
             s.work.clone(),
             Work {
                 requested_at: Instant::now(),
                 op,
-                cfg: s.saved.clone(),
+                cfg: runtime_cfg,
                 generation,
             },
         ))
@@ -1336,6 +1759,7 @@ unsafe fn receive_reports() {
                     }
                 }
                 refresh(false);
+                sync_desktop_mouse();
             }
             Report::Saved { cfg, result } => {
                 state(|s| s.saving = false);
@@ -1351,6 +1775,7 @@ unsafe fn receive_reports() {
                                 }
                             }
                             s.saved = *cfg;
+                            s.first_hotkey = None;
                             if old != s.hotkey_id {
                                 Some((s.owner, old))
                             } else {
@@ -1362,6 +1787,7 @@ unsafe fn receive_reports() {
                             let _ = UnregisterHotKey(h, id);
                         }
                         feedback("已保存");
+                        sync_desktop_mouse();
                         refresh(false);
                         save_draft();
                         finish_exit();
@@ -1373,6 +1799,7 @@ unsafe fn receive_reports() {
                         let remove = state(|s| {
                             s.exiting = false;
                             s.draft.hotkey = s.saved.hotkey;
+                            s.draft.desktop_hotkey = s.saved.desktop_hotkey;
                             s.reserved.take().map(|id| (s.owner, id))
                         })
                         .flatten();
@@ -1674,6 +2101,62 @@ unsafe extern "system" fn controller(h: HWND, m: u32, wparam: WPARAM, l: LPARAM)
             show_settings();
             LRESULT(0)
         }
+        WM_DISPLAY_SELECTION => {
+            let picker = HWND(l.0 as *mut _);
+            if state(|s| s.display_picker == picker).unwrap_or(false) {
+                if wparam.0 == 0 {
+                    if let Some(selection) = crate::display_picker::selection(picker) {
+                        let mut cfg = state(|s| s.draft.clone()).unwrap();
+                        cfg.selected_displays = selection;
+                        match cfg.validate() {
+                            Ok(()) => {
+                                state(|s| s.draft = cfg);
+                                refresh(false);
+                                save_draft();
+                            }
+                            Err(error) => feedback(error),
+                        }
+                    }
+                    crate::display_picker::close(picker);
+                }
+                state(|s| s.display_picker = HWND::default());
+                sync_desktop_mouse();
+            }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            match sog::native::displays() {
+                Ok(displays) => {
+                    state(|s| s.displays = displays);
+                }
+                Err(error) => {
+                    state(|s| s.displays.clear());
+                    feedback(error);
+                }
+            }
+            let overlay_handle = state(|s| s.overlay).unwrap_or_default();
+            if !overlay_handle.0.is_null() {
+                match current_overlay_rectangles().and_then(|rects| {
+                    configure_overlay_region(overlay_handle, &rects)?;
+                    if state(|s| s.cursor_hidden && has_uncovered_display(&s.displays, &rects))
+                        .unwrap_or(false)
+                    {
+                        if !state(|s| s.opts.test).unwrap_or(true) {
+                            sog::native::set_cursor_hidden(false)?;
+                        }
+                        state(|s| s.cursor_hidden = false);
+                    }
+                    Ok(())
+                }) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        feedback(error);
+                        request(Operation::Light, false);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
         WM_PANEL => {
             panel_command(wparam);
             LRESULT(0)
@@ -1685,15 +2168,34 @@ unsafe extern "system" fn controller(h: HWND, m: u32, wparam: WPARAM, l: LPARAM)
         WM_RELEASE_HOOK => {
             if !state(|s| s.capture).unwrap_or(false) {
                 stop_hook();
+                sync_desktop_mouse();
             }
             LRESULT(0)
         }
         WM_CANCEL_CAPTURE => {
-            cancel_capture();
+            if wparam.0 == 0 || state(|s| s.capture_target as usize == wparam.0).unwrap_or(false) {
+                cancel_capture();
+            }
             LRESULT(0)
         }
         WM_REPORT => {
             receive_reports();
+            LRESULT(0)
+        }
+        WM_DESKTOP_TOGGLE => {
+            if state(|s| {
+                (s.saved.hotkey.is_mouse() || s.saved.desktop_trigger_enabled)
+                    && s.mouse_token == wparam.0
+                    && s.ready
+                    && !s.exiting
+                    && !s.capture
+                    && s.phase != "measuring"
+                    && (GetTickCount64() as u32).wrapping_sub(l.0 as u32) <= 500
+            })
+            .unwrap_or(false)
+            {
+                toggle();
+            }
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -1702,7 +2204,22 @@ unsafe extern "system" fn controller(h: HWND, m: u32, wparam: WPARAM, l: LPARAM)
         }
         WM_HOTKEY => {
             if state(|s| !s.capture && s.hotkey_id == wparam.0 as i32).unwrap_or(false) {
-                toggle();
+                let now = GetTickCount64() as u32;
+                let fire = state(|s| {
+                    if s.saved.hotkey.is_mouse() {
+                        return false;
+                    }
+                    trigger_press(
+                        &mut s.first_hotkey,
+                        s.saved.hotkey_double_click,
+                        now,
+                        GetDoubleClickTime(),
+                    )
+                })
+                .unwrap_or(false);
+                if fire {
+                    toggle();
+                }
             }
             LRESULT(0)
         }
@@ -1838,7 +2355,11 @@ pub fn run() -> Result<(), String> {
         let opts = Options::parse()?;
         if let Some(path) = &opts.probe {
             let remote = sog::remote::detect();
-            let result = Native::new(false).scan();
+            let mut native = match &opts.restrict_id {
+                Some(id) => Native::restricted_to(vec![id.clone()])?,
+                None => Native::new(false),
+            };
+            let result = native.scan();
             return storage::atomic_json(
                 path,
                 &match result {
@@ -1923,7 +2444,10 @@ pub fn run() -> Result<(), String> {
                 owner,
                 settings: HWND::default(),
                 about: HWND::default(),
+                display_picker: HWND::default(),
                 overlay: HWND::default(),
+                displays: sog::native::displays().unwrap_or_default(),
+                dark_selection: None,
                 cursor_hidden: false,
                 presentation_trace: vec![],
                 opts: opts.clone(),
@@ -1933,8 +2457,12 @@ pub fn run() -> Result<(), String> {
                 reserved: None,
                 hotkey_id: 1,
                 capture: false,
+                capture_target: p::HOTKEY,
                 hook: HHOOK::default(),
+                mouse_capture_hook: HHOOK::default(),
                 captured_down: 0,
+                captured_mouse_down: 0,
+                first_hotkey: None,
                 desired: false,
                 phase: "starting",
                 ready: false,
@@ -1950,6 +2478,8 @@ pub fn run() -> Result<(), String> {
                 message,
                 taskbar,
                 tray_v4: false,
+                desktop_mouse: None,
+                mouse_token: 0,
             })
         });
         let hardware = thread::spawn(move || {
@@ -1998,6 +2528,10 @@ pub fn run() -> Result<(), String> {
         publish();
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let picker = state(|s| s.display_picker).unwrap_or_default();
+            if IsWindow(picker).as_bool() && IsDialogMessageW(picker, &msg).as_bool() {
+                continue;
+            }
             let about = state(|s| s.about).unwrap_or_default();
             if IsWindow(about).as_bool() && IsDialogMessageW(about, &msg).as_bool() {
                 continue;
@@ -2034,6 +2568,10 @@ pub fn run() -> Result<(), String> {
         }
         stop_hook();
         let _ = overlay(false, false);
+        let picker = state(|s| s.display_picker).unwrap_or_default();
+        if IsWindow(picker).as_bool() {
+            crate::display_picker::close(picker);
+        }
         tray(NIM_DELETE, owner, false);
         for id in [1, 2] {
             let _ = UnregisterHotKey(owner, id);
@@ -2050,5 +2588,116 @@ pub fn run() -> Result<(), String> {
         let _ = hardware.join();
         let _ = saver.join();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    fn display_fixture(id: &str, source: &str, rect: [i32; 4]) -> sog::native::DisplayInfo {
+        sog::native::DisplayInfo {
+            id: format!(r"\\?\DISPLAY#{id}#instance#{{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}}"),
+            name: id.into(),
+            source: source.into(),
+            internal: false,
+            rect,
+        }
+    }
+    #[test]
+    fn selected_overlay_keeps_unselected_screens_and_gaps_uncovered() {
+        let displays = [
+            display_fixture("typec", "DISPLAY3", [-2000, 0, 0, 3200]),
+            display_fixture("hdmi", "DISPLAY2", [0, 100, 2560, 1540]),
+        ];
+        let selected = vec![displays[0].id.clone()];
+        assert_eq!(
+            overlay_rectangles(&displays, Some(&selected), None).unwrap(),
+            vec![displays[0].rect]
+        );
+        let ddc = format!("ddc:{}", displays[0].id);
+        assert_eq!(
+            overlay_rectangles(&displays, None, Some(&ddc)).unwrap(),
+            vec![displays[0].rect]
+        );
+        assert!(overlay_rectangles(&displays, Some(&[]), None).is_err());
+        let disconnected = vec![display_fixture("gone", "DISPLAY4", [0, 0, 100, 100]).id];
+        assert!(overlay_rectangles(&displays, Some(&disconnected), None).is_err());
+        assert_eq!(overlay_rectangles(&displays, None, None).unwrap().len(), 2);
+        assert!(has_uncovered_display(&displays, &[displays[0].rect]));
+        assert!(!has_uncovered_display(&displays[..1], &[displays[0].rect]));
+        let mut mirrored = displays.to_vec();
+        mirrored[1].source = mirrored[0].source.clone();
+        assert!(overlay_rectangles(&mirrored, Some(&selected), None).is_err());
+    }
+    #[test]
+    fn presentation_adapter_forwards_selection_before_native_scan() {
+        struct SelectionOnly(bool);
+        impl Backend for SelectionOnly {
+            fn scan(&mut self) -> Result<Inventory, String> {
+                panic!("unfiltered scan")
+            }
+            fn scan_selected(
+                &mut self,
+                _: ScanRequest,
+                selected: Option<&[String]>,
+            ) -> Result<Inventory, String> {
+                assert_eq!(selected.unwrap(), &["selected"]);
+                self.0 = true;
+                Ok(Inventory::default())
+            }
+            fn write(&mut self, _: &str, _: Kind, _: u32) -> Result<(), String> {
+                unreachable!()
+            }
+            fn read(&mut self, _: &str, _: Kind) -> Result<u32, String> {
+                unreachable!()
+            }
+            fn cursor(&mut self, _: bool) -> Result<(), String> {
+                unreachable!()
+            }
+            fn remote_active(&self) -> bool {
+                false
+            }
+        }
+        let (sender, _) = mpsc::channel();
+        let mut backend = Presented {
+            inner: SelectionOnly(false),
+            sender,
+            owner: 0,
+            generation: Arc::new(AtomicU64::new(0)),
+            command_generation: 0,
+            op: Operation::Dark,
+            reveal_delay: 0,
+            reveal_on_write: false,
+            test: true,
+        };
+        backend
+            .scan_selected(ScanRequest::all(), Some(&["selected".into()]))
+            .unwrap();
+        assert!(backend.inner.0);
+    }
+    #[test]
+    fn keyboard_single_double_triple_and_tick_wrap_follow_separate_preferences() {
+        let mut first = None;
+        assert!(trigger_press(&mut first, false, 100, 500));
+        assert!(!trigger_press(&mut first, true, 200, 500));
+        assert!(trigger_press(&mut first, true, 300, 500));
+        assert!(!trigger_press(&mut first, true, 400, 500));
+        assert!(!trigger_press(&mut first, true, 1000, 500));
+        assert!(trigger_press(&mut first, true, 1100, 500));
+        assert!(!trigger_press(&mut first, true, u32::MAX - 30, 500));
+        assert!(trigger_press(&mut first, true, 40, 500));
+    }
+
+    #[test]
+    fn aliases_share_one_profile_identity_and_normal_path_keeps_legacy_spelling() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("test-data-profile-{}", std::process::id()));
+        fs::create_dir_all(base.join("child")).unwrap();
+        let normal = canonical_profile(base.clone()).unwrap();
+        let alias = canonical_profile(base.join("child").join("..")).unwrap();
+        assert_eq!(normal, alias);
+        assert!(!normal.to_string_lossy().starts_with(r"\\?\"));
+        fs::remove_dir(base.join("child")).unwrap();
+        fs::remove_dir(base).unwrap();
     }
 }

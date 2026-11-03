@@ -8,14 +8,16 @@ use windows::{
         Graphics::{Dwm::*, Gdi::*},
         UI::{
             Input::KeyboardAndMouse::{EnableWindow, SetFocus},
-            Shell::{DefSubclassProc, SetWindowSubclass},
+            Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW},
             WindowsAndMessaging::*,
         },
     },
 };
 
-pub const FIRST_LINE: &str = "一键熄屏 · Rust 0.3.0";
-const DESCRIPTION: &str = "本应用使用 Rust 编写，通过 Windows 接口实现软件熄屏。\r\n\r\n熄屏时覆盖全屏黑窗，并通过 DDC/CI 调低外接屏、通过 WMI 调低内置屏背光。黑窗可穿透点击，并从屏幕捕获中排除，便于远程操作。\r\n\r\n亮屏时恢复熄屏前的亮度和光标；启用关闭 HDR 时，也会还原原有 HDR 状态。\r\n\r\n使用设置中的全局热键或托盘菜单切换，再次执行即可恢复屏幕。显示器需支持相应的亮度接口，调低背光并非切断电源。";
+pub const FIRST_LINE: &str = concat!("一键熄屏 · Rust ", env!("CARGO_PKG_VERSION"));
+pub const REPOSITORY: &str = "https://github.com/shiranzby/screen-toggle";
+const OPEN_REPOSITORY: i32 = 13;
+const DESCRIPTION: &str = "本应用使用 Rust 编写，通过 Windows 接口实现软件熄屏。\r\n\r\n按所选屏幕覆盖黑窗，通过 DDC/CI 调低外接屏、通过 WMI 调低内置屏背光；可选关闭 HDR。黑窗允许点击穿透，并请求从屏幕捕获中排除。\r\n\r\n亮屏时按记录恢复原亮度和 HDR，后台回读确认。支持全局／桌面热键及单双击切换。调低背光并非切断显示器电源。";
 struct About {
     owner: HWND,
     colors: Palette,
@@ -61,7 +63,7 @@ pub unsafe fn show(owner: HWND, colors: Palette, activate: bool) -> Result<HWND,
         );
     }
     let width = s(520);
-    let height = s(420);
+    let height = s(460);
     let raw = Box::into_raw(about);
     let h = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_COMPOSITED,
@@ -91,7 +93,8 @@ pub unsafe fn show(owner: HWND, colors: Palette, activate: bool) -> Result<HWND,
     let children = (|| -> Result<HWND, String> {
         for (id, text, y, height, font) in [
             (10, FIRST_LINE, s(20), s(32), p.title),
-            (11, DESCRIPTION, s(66), client.bottom - s(126), p.body),
+            (11, DESCRIPTION, s(66), client.bottom - s(226), p.body),
+            (12, "作者：shiranzby", client.bottom - s(146), s(26), p.body),
         ] {
             let control = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -110,6 +113,23 @@ pub unsafe fn show(owner: HWND, colors: Palette, activate: bool) -> Result<HWND,
             .map_err(|e| e.to_string())?;
             SendMessageW(control, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(0));
         }
+        let link = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            w!("github.com/shiranzby/screen-toggle"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            s(24),
+            client.bottom - s(110),
+            client.right - s(48),
+            s(36),
+            h,
+            HMENU(OPEN_REPOSITORY as usize as *mut _),
+            None,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        SendMessageW(link, WM_SETFONT, WPARAM(p.body.0 as usize), LPARAM(0));
+        let _ = SetWindowSubclass(link, Some(button_proc), 1, h.0 as usize);
         let button = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("BUTTON"),
@@ -174,6 +194,17 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wparam: WPARAM, l: LPARAM) -> LR
             let _ = PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
             LRESULT(0)
         }
+        WM_COMMAND if wparam.0 as u16 as i32 == OPEN_REPOSITORY => {
+            ShellExecuteW(
+                h,
+                w!("open"),
+                PCWSTR(wide(REPOSITORY).as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            );
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let owner = p.owner;
             let activate = p.activate;
@@ -220,7 +251,7 @@ unsafe extern "system" fn button_proc(
             label(
                 dc,
                 r,
-                "确定",
+                &text(h),
                 p.body,
                 p.colors.ink,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
